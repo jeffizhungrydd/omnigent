@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -947,6 +948,68 @@ def should_dispatch_locally(tool_name: str) -> bool:
     function directly — Phase 5 of RUNNER_TOOL_DISPATCH.md.
     """
     return tool_name in _ALL_LOCAL_TOOLS
+
+
+# Granted tool names per live AgentSpec, keyed by ``id(spec)`` because
+# AgentSpec is an unhashable dataclass. The weakref guards against id reuse
+# after the spec is garbage-collected.
+_granted_tool_names_cache: dict[int, tuple[weakref.ref[AgentSpec], frozenset[str]]] = {}
+_GRANTED_TOOL_NAMES_CACHE_MAX = 256
+
+
+def _granted_tool_names(agent_spec: AgentSpec) -> frozenset[str]:
+    """Return the non-MCP tool surface advertised for *agent_spec*.
+
+    Mirrors advertisement: the names ``ToolManager`` registers, spec-local
+    tools by declared name (no workdir load needed), and ``sys_os_*`` for
+    native harnesses, whose relay advertises them unconditionally (see
+    :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned and
+    resolved by the MCP manager, never by this set.
+
+    :raises Exception: Propagates ``ToolManager`` construction failures so
+        callers can fail closed instead of guessing at the surface.
+    """
+    cached = _granted_tool_names_cache.get(id(agent_spec))
+    if cached is not None and cached[0]() is agent_spec:
+        return cached[1]
+    names = set(ToolManager(agent_spec).get_tool_names())
+    names.update(info.name for info in agent_spec.local_tools)
+    harness = agent_spec.executor.config.get("harness") or agent_spec.executor.type
+    if is_native_harness(harness if isinstance(harness, str) else None):
+        names.update(_OS_ENV_TOOLS)
+    granted = frozenset(names)
+    if len(_granted_tool_names_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
+        _granted_tool_names_cache.clear()
+    _granted_tool_names_cache[id(agent_spec)] = (weakref.ref(agent_spec), granted)
+    return granted
+
+
+def _ungranted_tool_reason(tool_name: str, agent_spec: AgentSpec | None) -> str | None:
+    """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
+
+    The check is skipped when no granted surface is known: ``agent_spec`` is
+    ``None`` (spec-less dispatch paths) or is not a real :class:`AgentSpec`
+    (partial stand-ins cannot build a ``ToolManager``). Fails closed when the
+    surface exists but cannot be computed.
+    """
+    from omnigent.spec.types import AgentSpec as _AgentSpec
+
+    if not isinstance(agent_spec, _AgentSpec):
+        return None
+    try:
+        granted = _granted_tool_names(agent_spec)
+    except Exception as exc:
+        _logger.exception("granted tool surface unavailable for %s", tool_name)
+        return (
+            f"tool {tool_name!r} is not enabled: the agent's granted tool surface "
+            f"could not be resolved ({type(exc).__name__}: {exc})"
+        )
+    if tool_name in granted:
+        return None
+    return (
+        f"tool {tool_name!r} is not enabled for this agent "
+        f"(not in the agent spec's registered tool surface)"
+    )
 
 
 def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
@@ -6214,6 +6277,12 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+    # MCP dispatch resolves the target against the spec inside the MCP
+    # manager; every other branch is gated on the spec's granted surface.
+    if mcp_manager is None:
+        refusal = _ungranted_tool_reason(tool_name, agent_spec)
+        if refusal is not None:
+            return json.dumps({"error": refusal})
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -7965,6 +8034,10 @@ def _spawn_async_tool(
         return "Error: sys_call_async cannot dispatch itself"
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
+    if mcp_manager is None:
+        refusal = _ungranted_tool_reason(target_tool, agent_spec)
+        if refusal is not None:
+            return f"Error: sys_call_async refused: {refusal}"
 
     handle_id = f"handle_{uuid.uuid4().hex[:12]}"
     cancel_event = asyncio.Event()
