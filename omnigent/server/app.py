@@ -3415,6 +3415,11 @@ def create_app(
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; the provider re-checks the row exists.
+            auth_provider.set_user_exists_check(
+                lambda user_id: account_store.get_user(user_id) is not None
+            )
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -3422,6 +3427,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

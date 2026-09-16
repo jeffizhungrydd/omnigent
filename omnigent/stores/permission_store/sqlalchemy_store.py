@@ -444,6 +444,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
 
+    def user_exists(self, user_id: str) -> bool:
+        """Check for a user row. See base class for contract."""
+        with self._session("select_user_exists") as session:
+            return session.get(SqlUser, (current_workspace_id(), user_id)) is not None
+
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session("list_users") as session:

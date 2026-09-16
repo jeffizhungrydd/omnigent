@@ -49,6 +49,7 @@ from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
     from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -219,6 +220,7 @@ def create_accounts_auth_router(
     admin_list: AdminList,
     permission_store: PermissionStore | None = None,
     device_grant_store: DeviceGrantStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -247,6 +249,9 @@ def create_accounts_auth_router(
         this flag; the web browser form never does, so long-lived
         unattended credentials never reach a browser session. See
         :func:`omnigent.server.routes.device_auth.issue_login_grant`.
+    :param scheduled_task_store: When set, ``DELETE /auth/users/{id}``
+        disarms the scheduler timers of the deleted user's tasks (the
+        rows themselves are disabled by ``AccountStore.delete_user``).
     :returns: APIRouter to mount at ``/auth``.
     """
     if auth_provider._source != "accounts":
@@ -732,6 +737,10 @@ def create_accounts_auth_router(
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
 
+        owned_task_ids: list[str] = []
+        if scheduled_task_store is not None:
+            owned_task_ids = [t.id for t in scheduled_task_store.list(owner_user_id=user_id)]
+
         result = account_store.delete_user(user_id)
         if result is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
@@ -743,6 +752,13 @@ def create_accounts_auth_router(
                     "user first or the deploy would have no recovery path"
                 },
             )
+        # The store already disabled the rows; drop the in-memory timers so
+        # the scheduler stops re-arming them.
+        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
+        if scheduler is not None:
+            for task_id in owned_task_ids:
+                scheduler.remove(task_id)
+        auth_provider.revoke_user_sessions(user_id)
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/reset")
