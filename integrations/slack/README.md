@@ -179,8 +179,9 @@ value as the bot's `OMNIGENT_DEVICE_CLIENT_SECRET` so only this authorized
 socket server can drive the device flow.
 - `oidc` **mode** → the server's **PKCE-bound cli-login ticket flow**
 (`/auth/cli-login` + `/auth/cli-poll`). The modal shows a login link and
-confirmation code; the user signs in and explicitly approves the request at
-*your IdP* in their browser. The server hands back its session JWT — the same
+confirmation code; the user signs in at *your IdP* in their browser, then
+explicitly approves the request on the server's consent page (checking the
+code matches). The server hands back its session JWT — the same
 token a browser session gets. There is **no device grant and no refresh token**:
 the session lasts its normal TTL (default 8h), after which the user logs in
 again.

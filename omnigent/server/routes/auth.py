@@ -17,6 +17,7 @@ import hmac
 import html
 import json
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# RFC 7636 §4.2: base64url(SHA-256) is 43 chars; allow up to the spec max.
+_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -69,12 +72,13 @@ if TYPE_CHECKING:
 class _CliTicket:
     """A pending CLI login ticket.
 
-    Created by ``POST /auth/cli-login``, fulfilled by the browser
-    callback, polled by ``GET /auth/cli-poll``.
+    Created by ``POST /auth/cli-login``, fulfilled when the signed-in
+    user approves it at ``POST /auth/cli-approve``, polled by
+    ``GET /auth/cli-poll`` with the matching PKCE verifier.
 
     :param created_at: Unix timestamp when the ticket was created.
-    :param token: The session JWT, set when the browser callback
-        fulfills the ticket. ``None`` while pending.
+    :param token: The session JWT, set when the browser approves the
+        ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
     :param refresh_token: Login-issued refresh grant material, set at
@@ -584,8 +588,7 @@ def create_auth_router(
         code_challenge_method = body.get("code_challenge_method")
         if (
             not isinstance(code_challenge, str)
-            or not 43 <= len(code_challenge) <= 128
-            or not all(char.isalnum() or char in "_-" for char in code_challenge)
+            or _CODE_CHALLENGE_RE.fullmatch(code_challenge) is None
             or (code_challenge_method is not None and code_challenge_method != "S256")
         ):
             return JSONResponse(
