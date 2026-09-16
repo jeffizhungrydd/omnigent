@@ -10,6 +10,8 @@ logout, and expired-ticket eviction.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -33,6 +35,16 @@ pytestmark = pytest.mark.asyncio
 
 _TEST_SECRET = b"a" * 32
 _GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = "a" * 64
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return verifier, challenge
 
 
 def _make_oidc_config() -> OIDCConfig:
@@ -167,14 +179,28 @@ async def test_login_redirects_to_idp_with_pkce_params() -> None:
 async def test_cli_login_creates_ticket() -> None:
     """POST /auth/cli-login returns a ticket_id and login URL."""
     transport = _build_oidc_app()
+    _, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
 
     assert resp.status_code == 200
     body = resp.json()
     assert "ticket" in body
     assert "login_url" in body
     assert body["login_url"].startswith("/auth/login?ticket=")
+    assert body["user_code"]
+
+
+async def test_cli_login_rejects_old_client_without_challenge() -> None:
+    transport = _build_oidc_app()
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/auth/cli-login")
+
+    assert resp.status_code == 400
+    assert "Upgrade" in resp.json()["error"]
 
 
 # ── 3. CLI poll (pending) ─────────────────────────────────────────
@@ -183,13 +209,17 @@ async def test_cli_login_creates_ticket() -> None:
 async def test_cli_poll_returns_pending_before_callback() -> None:
     """GET /auth/cli-poll returns 202 while the ticket is unfulfilled."""
     transport = _build_oidc_app()
+    verifier, challenge = _pkce_pair()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         # Create a ticket first.
-        create_resp = await client.post("/auth/cli-login")
+        create_resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "code_challenge_method": "S256"},
+        )
         ticket_id = create_resp.json()["ticket"]
 
         # Poll -- should be pending.
-        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}")
+        poll_resp = await client.get(f"/auth/cli-poll?ticket={ticket_id}&code_verifier={verifier}")
 
     assert poll_resp.status_code == 202
     assert poll_resp.json()["status"] == "pending"
