@@ -9045,6 +9045,9 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    effective_harness=_session_harness_name(
+                                                        conv_id
+                                                    ),
                                                 )
                                             )
                                         )
@@ -12192,6 +12195,7 @@ def create_runner_app(
                         harness_client=None,
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
+                        effective_harness=_session_harness_name(session_id),
                     )
                 except Exception as exc:
                     _logger.exception(
