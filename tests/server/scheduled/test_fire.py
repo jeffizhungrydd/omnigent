@@ -469,6 +469,41 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert "alice" in store.runs[0]["error"]
 
 
+@pytest.mark.asyncio
+async def test_owner_deleted_mid_fire_is_not_dispatched() -> None:
+    """An owner deleted after the initial check but before dispatch still
+    stops the launch: the fire re-checks before handing off to a runner."""
+    perm = FakePermissionStore(users={"alice"})
+    conv_store = FakeConversationStore()
+    orig_create = conv_store.create_conversation
+
+    def create_and_delete_owner(**kwargs: Any) -> Any:
+        conv = orig_create(**kwargs)
+        assert perm.users is not None
+        perm.users.discard("alice")
+        return conv
+
+    conv_store.create_conversation = create_and_delete_owner  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert len(conv_store.created) == 1
+    assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert store.runs and store.runs[-1]["status"] == "failed"
+    assert store.runs[-1]["error_code"] == "owner_deleted"
+
+
 def _claude_agent_deps(
     store: FakeScheduledTaskStore, conv_store: FakeConversationStore, *, harness: str
 ) -> FireDeps:

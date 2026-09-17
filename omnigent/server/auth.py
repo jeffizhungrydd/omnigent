@@ -675,6 +675,17 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
+            # A grant-backed token acts for the user in ``sub``, so a deleted
+            # account must stop authenticating even while its grant row is
+            # live (a login racing the delete can mint one the revocation
+            # sweep never saw). Scope-only client-credentials tokens act as a
+            # client id, not a user row, and are exempt.
+            if (
+                grant_id is not None
+                and self._user_exists is not None
+                and not self._user_exists(user_id)
+            ):
+                return None
             return user_id
 
         # A plain session JWT has no stored grant to revoke, so a deleted

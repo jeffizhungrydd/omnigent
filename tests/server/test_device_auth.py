@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 _KEY = b"k" * 32
 
@@ -100,7 +101,11 @@ def test_router_factory_rejects_github_oauth_oidc(tmp_path: Path) -> None:
 
 @pytest.fixture
 def store(tmp_path: Path) -> DeviceGrantStore:
-    return DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    db_url = f"sqlite:///{tmp_path}/dg.db"
+    # Login grants are only issued for existing accounts; create the row the
+    # login flow would have ensured.
+    SqlAlchemyPermissionStore(db_url).ensure_user("alice@example.com")
+    return DeviceGrantStore(db_url)
 
 
 def _new_grant(store: DeviceGrantStore, device_code: str = "dc", now: int = 1000):
@@ -636,6 +641,21 @@ def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -
     assert store.get_by_id("lg2") is None
 
 
+def test_create_redeemed_grant_refused_for_missing_user(store: DeviceGrantStore) -> None:
+    """No grant may be minted for an account that does not exist — a login
+    racing its own account's deletion must not walk away with refresh
+    material the revocation sweep never saw."""
+    with pytest.raises(LookupError):
+        store.create_redeemed_grant(
+            "lg-ghost",
+            user_id="ghost@example.com",
+            client_id="omnigent-cli",
+            refresh_token_hash=hash_secret("r1", _KEY),
+            created_at=1000,
+        )
+    assert store.get_by_id("lg-ghost") is None
+
+
 def test_login_grant_refresh_round_trip(disabled_app: TestClient, tmp_path: Path) -> None:
     """A login-issued refresh grant renews via /oauth/token even with the
     device flow disabled — the core unattended-host fix.
@@ -810,7 +830,10 @@ def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
     )
 
     provider = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(cookie_secret=_KEY))
-    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    db_url = f"sqlite:///{tmp_path}/dg.db"
+    # OIDC login ensure_user()s the identity before issuing its grant.
+    SqlAlchemyPermissionStore(db_url).ensure_user("alice@example.com")
+    store = DeviceGrantStore(db_url)
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
 

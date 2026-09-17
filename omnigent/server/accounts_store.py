@@ -31,7 +31,7 @@ from __future__ import annotations
 import time
 from typing import cast
 
-from sqlalchemy import and_, delete, exists, func, not_, or_, select, update
+from sqlalchemy import and_, delete, exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -111,52 +111,52 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
             prev_refresh_token_hash=None,
         )
     )
-    host_ids = list(
+    # Row locks serialize this cleanup with managed-sandbox replacement,
+    # like HostStore.delete_host: classifying then acting on unlocked rows
+    # would let a host gain a sandbox between the two statements and escape
+    # both. SQLite ignores FOR UPDATE; its write transaction already locks.
+    host_rows = (
         session.execute(
-            select(SqlHost.host_id).where(
+            select(SqlHost)
+            .where(
                 SqlHost.workspace_id == workspace_id,
                 SqlHost.user_id == user_id,
             )
+            .with_for_update()
         )
         .scalars()
         .all()
     )
-    if not host_ids:
+    if not host_rows:
         return
     session.execute(
         update(SqlConversationMetadata)
         .where(
             SqlConversationMetadata.workspace_id == workspace_id,
-            SqlConversationMetadata.host_id.in_(host_ids),
+            SqlConversationMetadata.host_id.in_([row.host_id for row in host_rows]),
         )
         .values(host_id=None)
     )
-    pending_cleanup = and_(
-        SqlHost.sandbox_provider.is_not(None),
-        or_(SqlHost.sandbox_id.is_not(None), SqlHost.terminating_sandbox_id.is_not(None)),
-    )
-    session.execute(
-        update(SqlHost)
-        .where(
-            SqlHost.workspace_id == workspace_id,
-            SqlHost.user_id == user_id,
-            pending_cleanup,
+    doomed: list[str] = []
+    for row in host_rows:
+        pending_cleanup = row.sandbox_provider is not None and (
+            row.sandbox_id is not None or row.terminating_sandbox_id is not None
         )
-        .values(
-            token_hash=None,
-            token_expires_at=None,
-            status=encode_host_status("offline"),
-            deleted_at=func.coalesce(SqlHost.deleted_at, now),
-            updated_at=now,
+        if pending_cleanup:
+            row.token_hash = None
+            row.token_expires_at = None
+            row.status = encode_host_status("offline")
+            row.deleted_at = row.deleted_at or now
+            row.updated_at = now
+        else:
+            doomed.append(row.host_id)
+    if doomed:
+        session.execute(
+            delete(SqlHost).where(
+                SqlHost.workspace_id == workspace_id,
+                SqlHost.host_id.in_(doomed),
+            )
         )
-    )
-    session.execute(
-        delete(SqlHost).where(
-            SqlHost.workspace_id == workspace_id,
-            SqlHost.user_id == user_id,
-            not_(pending_cleanup),
-        )
-    )
 
 
 def _to_account_token(row: SqlAccountToken) -> AccountToken:
@@ -387,7 +387,16 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> bool | None:
-            target = session.get(SqlUser, (current_workspace_id(), user_id))
+            # Lock the user row first so authority issuance that also locks
+            # it (e.g. DeviceGrantStore.create_redeemed_grant) fully
+            # serializes with the delete: a grant committed before this
+            # lock is seen by the revocation below; one that waits on it
+            # finds the row gone and refuses.
+            target = session.get(
+                SqlUser,
+                (current_workspace_id(), user_id),
+                with_for_update=True if self._supports_for_update else None,
+            )
             if target is None:
                 return None
             if target.is_admin:

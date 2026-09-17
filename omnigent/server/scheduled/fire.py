@@ -333,21 +333,7 @@ async def _run_fire_for_task(
             return
 
         if await _owner_is_deleted(deps, task):
-            _logger.warning(
-                "scheduled fire: task %s owner %r no longer exists — disabling task",
-                task.id,
-                task.user_id,
-            )
-            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=f"owner {task.user_id!r} no longer exists; task disabled",
-                error_code="owner_deleted",
-            )
+            await _disable_task_for_deleted_owner(deps, task, scheduled_at)
             return
 
         # Resolve the effective launch target. An unset ``host_id`` means "you
@@ -472,6 +458,17 @@ async def _run_fire_for_task(
             )
             return
 
+        # Deletion may have raced the fire since the check above; re-check
+        # before handing the session to a runner. The window between this
+        # check and the dispatch is not synchronized with deletion — a fire
+        # that slips through launches once, but with revoked authority: the
+        # owner's tokens, grants, and host row are already gone.
+        if await _owner_is_deleted(deps, task):
+            await _disable_task_for_deleted_owner(
+                deps, task, scheduled_at, conversation_id=conv.id
+            )
+            return
+
         try:
             await dispatch(conv, effective)
         except Exception:
@@ -497,6 +494,35 @@ async def _run_fire_for_task(
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
+
+
+async def _disable_task_for_deleted_owner(
+    deps: FireDeps,
+    task: ScheduledTask,
+    scheduled_at: int,
+    *,
+    conversation_id: str | None = None,
+) -> None:
+    """Disable a fired task whose owner no longer exists and record why.
+
+    :param conversation_id: Session already created for this fire, when the
+        owner vanished mid-fire; recorded on the failed run.
+    """
+    _logger.warning(
+        "scheduled fire: task %s owner %r no longer exists — disabling task",
+        task.id,
+        task.user_id,
+    )
+    await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    await _record_run(
+        deps,
+        task,
+        conversation_id,
+        scheduled_at,
+        status="failed",
+        error=f"owner {task.user_id!r} no longer exists; task disabled",
+        error_code="owner_deleted",
+    )
 
 
 async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:

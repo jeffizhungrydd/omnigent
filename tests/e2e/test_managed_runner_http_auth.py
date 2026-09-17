@@ -67,6 +67,7 @@ from omnigent.server.oidc import mint_session_cookie
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests._helpers.live_server import find_free_port
 from tests.server.helpers import build_agent_bundle
@@ -188,6 +189,10 @@ def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
     :param db_uri: SQLite URI of the server's database.
     :returns: The created session id.
     """
+    # The cookie only authenticates while Alice's account row exists (the
+    # server rejects session JWTs for deleted/unknown accounts), so
+    # materialize the row the login flow would have created.
+    SqlAlchemyPermissionStore(db_uri).ensure_user(_OWNER)
     owner_cookie = mint_session_cookie(_OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts")
     bundle = build_agent_bundle(name="e2e-managed-runner-agent")
     with httpx.Client(base_url=base_url, timeout=30.0) as http:

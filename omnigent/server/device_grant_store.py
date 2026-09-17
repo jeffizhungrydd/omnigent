@@ -28,11 +28,11 @@ import hmac
 import secrets
 from typing import cast
 
-from sqlalchemy import and_, delete, or_, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
+from omnigent.db.db_models import SqlDeviceGrant, SqlUser, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -186,6 +186,21 @@ class DeviceGrantStore:
         user_code = secrets.token_urlsafe(16)
 
         def write(session: Session) -> DeviceGrant:
+            # Lock the user row so issuance serializes with account
+            # deletion: either this grant commits first and the delete's
+            # revocation sweep sees it, or the row is gone and no grant is
+            # minted. SQLite ignores FOR UPDATE; its write transaction
+            # already serializes.
+            owner = session.execute(
+                select(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if owner is None:
+                raise LookupError(f"cannot issue grant: user {user_id!r} does not exist")
             row = SqlDeviceGrant(
                 id=grant_id,
                 device_code_hash=device_code_hash,
