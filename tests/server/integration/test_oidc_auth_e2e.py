@@ -23,18 +23,15 @@ import pytest
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig
 from omnigent.server.routes.auth import (
     _CLI_TICKET_TTL_SECONDS,
     _CliTicket,
     _evict_expired_tickets,
     create_auth_router,
 )
+from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
 
 pytestmark = pytest.mark.asyncio
-
-_TEST_SECRET = b"a" * 32
-_GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -47,32 +44,11 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def _make_oidc_config() -> OIDCConfig:
-    """Build a minimal GitHub-flavoured OIDCConfig for testing."""
-    return OIDCConfig(
-        issuer="https://github.com",
-        client_id="test-client-id",
-        client_secret="test-client-secret",
-        redirect_uri="http://localhost:8000/auth/callback",
-        cookie_secret=_TEST_SECRET,
-        scopes="read:user user:email",
-        session_ttl_hours=8,
-        logout_redirect_uri=None,
-        allowed_domains=None,
-        provider_type="github",
-        authorization_endpoint="https://github.com/login/oauth/authorize",
-        token_endpoint=_GITHUB_TOKEN_ENDPOINT,
-        jwks_uri=None,
-        userinfo_endpoint="https://api.github.com/user",
-        allow_invites=False,
-    )
-
-
 def _build_oidc_app() -> httpx.ASGITransport:
     """Build a minimal FastAPI app with only the OIDC auth router."""
     from fastapi import FastAPI
 
-    config = _make_oidc_config()
+    config = make_oidc_config()
     auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
 
@@ -94,7 +70,7 @@ def _mint_state_cookie(
     ticket: str | None = None,
 ) -> str:
     """Mint a signed auth-state cookie matching what /auth/login produces."""
-    config = _make_oidc_config()
+    config = make_oidc_config()
     payload: dict = {
         "state": state,
         "code_verifier": code_verifier,
@@ -266,7 +242,7 @@ async def test_callback_exchanges_code_and_sets_session_cookie() -> None:
     assert "ap_session" in resp.cookies
     # Validate the session JWT.
     session_jwt = resp.cookies["ap_session"]
-    payload = jwt.decode(session_jwt, _TEST_SECRET, algorithms=["HS256"])
+    payload = jwt.decode(session_jwt, TEST_SIGNING_KEY, algorithms=["HS256"])
     assert payload["sub"] == "alice@example.com"
 
 

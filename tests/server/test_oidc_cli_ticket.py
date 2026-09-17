@@ -17,10 +17,9 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.routes.auth import create_auth_router
+from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
 from tests.server.integration.test_oidc_auth_e2e import (
-    _TEST_SECRET,
     _build_oidc_app,
-    _make_oidc_config,
     _mint_state_cookie,
     _mock_httpx_client_for_github,
     _pkce_pair,
@@ -35,7 +34,7 @@ def _authenticated_origin_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_app(store: DeviceGrantStore | None = None) -> httpx.ASGITransport:
-    config = _make_oidc_config()
+    config = make_oidc_config()
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     router = create_auth_router(
         auth_provider=provider,
@@ -103,7 +102,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         fulfilled = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert fulfilled.status_code == 200
         body = fulfilled.json()
-        payload = jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
         assert payload["sub"] == "alice@example.com"
         assert body["user_id"] == "alice@example.com"
         assert body["refresh_token"]
@@ -194,12 +193,7 @@ async def test_cli_approve_rejects_stale_session() -> None:
         ticket, verifier = await _create_ticket(client)
         await _complete_callback(client, ticket)
         with patch("omnigent.server.oidc.time.time", return_value=time.time() - 10):
-            stale = mint_session_cookie(
-                user_id="alice@example.com",
-                cookie_secret=_TEST_SECRET,
-                ttl_hours=8,
-                provider="github",
-            )
+            stale = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")
         client.cookies.set("ap_session", stale)
         approved = await client.post(
             "/auth/cli-approve",

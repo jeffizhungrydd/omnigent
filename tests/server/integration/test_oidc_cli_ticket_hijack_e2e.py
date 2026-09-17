@@ -30,39 +30,18 @@ import pytest
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
-from omnigent.server.oidc import OIDCConfig
 from omnigent.server.routes.auth import create_auth_router
+from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY, make_oidc_config
 
 pytestmark = pytest.mark.asyncio
 
-_TEST_SECRET = b"a" * 32
 _VICTIM_EMAIL = "victim@example.com"
-
-
-def _make_oidc_config() -> OIDCConfig:
-    return OIDCConfig(
-        issuer="https://github.com",
-        client_id="test-client-id",
-        client_secret="test-client-secret",
-        redirect_uri="http://localhost:8000/auth/callback",
-        cookie_secret=_TEST_SECRET,
-        scopes="read:user user:email",
-        session_ttl_hours=8,
-        logout_redirect_uri=None,
-        allowed_domains=None,
-        provider_type="github",
-        authorization_endpoint="https://github.com/login/oauth/authorize",
-        token_endpoint="https://github.com/login/oauth/access_token",
-        jwks_uri=None,
-        userinfo_endpoint="https://api.github.com/user",
-        allow_invites=False,
-    )
 
 
 def _build_oidc_app(grant_store: DeviceGrantStore) -> httpx.ASGITransport:
     from fastapi import FastAPI
 
-    config = _make_oidc_config()
+    config = make_oidc_config()
     auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
     router = create_auth_router(
@@ -158,7 +137,7 @@ async def test_attacker_ticket_not_redeemable_after_passive_victim_signin(
 
     if poll.status_code == 200:
         body = poll.json()
-        stolen = jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])
+        stolen = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
         pytest.fail(
             "CLI-login ticket hijack: an unauthenticated poller redeemed the "
             "victim's ticket with no explicit consent step. cli-poll returned "
