@@ -47,6 +47,10 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+# Longest a session JWT is trusted from the identity cache before the
+# account's existence is re-checked (bounds the window on other replicas
+# after a delete).
+_USER_CHECK_INTERVAL_S = 60.0
 
 # Path prefixes a restricted (device-grant or machine client-credential)
 # access token may reach.
@@ -478,6 +482,10 @@ class UnifiedAuthProvider(AuthProvider):
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        # Set by create_app in accounts mode. Returns True while the
+        # user row still exists; a deleted account's session JWTs stop
+        # authenticating even though they are still validly signed.
+        self._user_exists: Callable[[str], bool] | None = None
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -486,6 +494,33 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_user_exists_check(self, check: Callable[[str], bool]) -> None:
+        """Wire the account-existence lookup consulted on session-JWT validation.
+
+        While wired, plain session tokens are re-checked against the
+        account store at least every :data:`_USER_CHECK_INTERVAL_S`
+        seconds instead of being cached for their whole lifetime.
+
+        :param check: Callable mapping a user id to True when the
+            account still exists.
+        """
+        self._user_exists = check
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        """Drop this process's cached identity for every token of *user_id*.
+
+        Combined with :meth:`set_user_exists_check`, the next request
+        bearing one of the user's session JWTs re-validates against the
+        account store and is rejected.
+
+        :param user_id: The deleted account, e.g. ``"alice"``.
+        """
+        stale = [
+            key for key, (cached_user, _) in self._cookie_cache.items() if cached_user == user_id
+        ]
+        for key in stale:
+            del self._cookie_cache[key]
 
     @property
     def login_url(self) -> str | None:
@@ -640,10 +675,30 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
+            # A grant-backed token acts for the user in ``sub``, so a deleted
+            # account must stop authenticating even while its grant row is
+            # live (a login racing the delete can mint one the revocation
+            # sweep never saw). Scope-only client-credentials tokens act as a
+            # client id, not a user row, and are exempt.
+            if (
+                grant_id is not None
+                and self._user_exists is not None
+                and not self._user_exists(user_id)
+            ):
+                return None
             return user_id
+
+        # A plain session JWT has no stored grant to revoke, so a deleted
+        # account is caught by re-checking that its user row still exists.
+        # Scoped machine tokens act as a client id, not a user row, and
+        # returned above.
+        if self._user_exists is not None and not self._user_exists(user_id):
+            return None
 
         # Cache for remaining lifetime of the token.
         remaining = payload.get("exp", 0) - time.time()
+        if self._user_exists is not None:
+            remaining = min(remaining, _USER_CHECK_INTERVAL_S)
         if remaining > 0:
             self._cookie_cache[cache_key] = (
                 user_id,

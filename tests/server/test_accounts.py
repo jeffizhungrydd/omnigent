@@ -1660,6 +1660,188 @@ def test_admin_can_delete_normal_member(accounts_app: TestClient) -> None:
     assert "alice" not in {u["id"] for u in post["users"]}
 
 
+def test_delete_user_revokes_durable_authority(accounts_app: TestClient, tmp_path: Path) -> None:
+    """Deleting a user also kills everything that could act as them later.
+
+    Scheduled tasks are disabled, refresh grants revoked, hosts removed,
+    and an already-issued session cookie stops authenticating — all in
+    the same request, so a deleted identity cannot keep running
+    unattended work or minting new tokens.
+    """
+    import os
+    import uuid
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    cookie_secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    alice = TestClient(accounts_app.app)
+    r = alice.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+    )
+    assert r.status_code == 200, r.text
+    r = alice.post(
+        "/auth/login",
+        json={"username": "alice", "password": "alice-pw-1234", "issue_refresh": True},
+    )
+    assert r.status_code == 200, r.text
+    refresh_token = r.json()["refresh_token"]
+    assert alice.get("/auth/me").status_code == 200
+
+    tasks = SqlAlchemyScheduledTaskStore(db_url)
+    task = tasks.create(
+        uuid.uuid4().hex, "nightly", "do it", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+    )
+    hosts = HostStore(db_url)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+    grants = DeviceGrantStore(db_url)
+    grant = grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret))
+    assert grant is not None and grant.user_id == "alice"
+
+    resp = admin.delete("/auth/users/alice")
+    assert resp.status_code == 204, resp.text
+
+    got = tasks.get(task.id)
+    assert got is not None and got.state == "deleted"
+    assert tasks.list_active() == []
+    assert grants.is_revoked(grant.id)
+    assert grants.get_by_refresh_hash(hash_secret(refresh_token, cookie_secret)) is None
+    assert hosts.get_host(host.host_id) is None
+    assert hosts.list_hosts("alice") == []
+    # The still-signed cookie no longer authenticates.
+    assert alice.get("/auth/me").status_code == 401
+
+
+def test_delete_user_tombstones_host_with_pending_sandbox(
+    accounts_app: TestClient, tmp_path: Path
+) -> None:
+    """A managed host that still owns a sandbox is tombstoned, not dropped,
+    so the sandbox reaper can finish provider cleanup — but its launch
+    credential is revoked and it disappears from normal views."""
+    import uuid
+
+    from omnigent.stores.host_store import HostStore
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    alice = TestClient(accounts_app.app)
+    r = alice.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+    )
+    assert r.status_code == 200, r.text
+
+    hosts = HostStore(db_url)
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+    replaced = hosts.replace_managed_host_sandbox(
+        host_id=host.host_id,
+        user_id="alice",
+        token="fake-launch-token",
+        provider="databricks",
+        sandbox_id="sbx-1",
+        token_expires_at=2**31,
+    )
+    assert replaced is not None
+
+    resp = admin.delete("/auth/users/alice")
+    assert resp.status_code == 204, resp.text
+
+    assert hosts.get_host(host.host_id) is None
+    assert hosts.list_hosts("alice") == []
+    page = hosts.list_current_managed_sandbox_hosts_page(after=None, limit=100)
+    tombstones = [h for _, h in page if h.host_id == host.host_id]
+    assert tombstones and tombstones[0].deleted_at is not None
+    assert tombstones[0].sandbox_id == "sbx-1"
+
+
+def test_deleted_user_grant_backed_token_rejected(
+    accounts_app: TestClient, tmp_path: Path
+) -> None:
+    """A grant-backed access token stops authenticating once its user is
+    deleted, even while the grant row itself is live and unrevoked.
+
+    A login racing the delete can commit a refresh grant the revocation
+    sweep never saw; the auth layer must still refuse the deleted
+    identity. The grant row is inserted directly to simulate that race
+    artifact (normal issuance now refuses a missing user).
+    """
+    import os
+    import time
+    import uuid
+
+    import jwt
+    from sqlalchemy.orm import Session as OrmSession
+
+    from omnigent.db.db_models import SqlDeviceGrant
+    from omnigent.db.enum_codecs import encode_device_grant_status
+    from omnigent.db.utils import get_or_create_engine
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    cookie_secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+
+    def _register(username: str) -> None:
+        invite = admin.post("/auth/invite", json={}).json()["token"]
+        r = TestClient(accounts_app.app).post(
+            "/auth/register",
+            json={"invite": invite, "username": username, "password": f"{username}-pw-1234"},
+        )
+        assert r.status_code == 200, r.text
+
+    def _raced_grant(grant_id: str, username: str) -> None:
+        now = int(time.time())
+        with OrmSession(get_or_create_engine(db_url)) as session, session.begin():
+            session.add(
+                SqlDeviceGrant(
+                    id=grant_id,
+                    device_code_hash=uuid.uuid4().hex,
+                    user_code=uuid.uuid4().hex,
+                    status=encode_device_grant_status("redeemed"),
+                    client_id="omnigent-cli",
+                    user_id=username,
+                    refresh_token_hash=uuid.uuid4().hex,
+                    prev_refresh_token_hash=None,
+                    created_at=now,
+                    expires_at=now,
+                    approved_at=now,
+                    last_polled_at=None,
+                )
+            )
+
+    def _access_token(username: str, grant_id: str) -> str:
+        return jwt.encode(
+            {"sub": username, "grant_id": grant_id, "exp": int(time.time()) + 300},
+            cookie_secret,
+            algorithm="HS256",
+        )
+
+    _register("alice")
+    _register("bob")
+    assert admin.delete("/auth/users/alice").status_code == 204
+    _raced_grant("raced-alice", "alice")
+    _raced_grant("raced-bob", "bob")
+
+    fresh = TestClient(accounts_app.app)
+    # Control: the same-shaped token authenticates while the account exists…
+    ok = fresh.get(
+        "/v1/hosts", headers={"Authorization": f"Bearer {_access_token('bob', 'raced-bob')}"}
+    )
+    assert ok.status_code == 200, (ok.status_code, ok.text)
+    # …but the deleted account is refused despite its live grant row.
+    denied = fresh.get(
+        "/v1/hosts", headers={"Authorization": f"Bearer {_access_token('alice', 'raced-alice')}"}
+    )
+    assert denied.status_code == 401, (denied.status_code, denied.text)
+
+
 def test_change_own_password_round_trip(accounts_app: TestClient) -> None:
     """POST /auth/users/me/password rotates the password.
 

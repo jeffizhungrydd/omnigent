@@ -38,11 +38,21 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlAccountToken,
+    SqlConversationMetadata,
+    SqlDeviceGrant,
+    SqlHost,
+    SqlScheduledTask,
     SqlSessionPermission,
     SqlUser,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import decode_account_token_kind, encode_account_token_kind
+from omnigent.db.enum_codecs import (
+    decode_account_token_kind,
+    encode_account_token_kind,
+    encode_device_grant_status,
+    encode_host_status,
+    encode_scheduled_task_state,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -68,6 +78,85 @@ def _to_account(row: SqlUser) -> Account:
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
     )
+
+
+def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> None:
+    """Disable everything *user_id* owns that could act without them present.
+
+    Runs inside the caller's ``delete_user`` transaction. Hosts mirror
+    :meth:`HostStore.delete_host`: bound sessions are detached, launch
+    credentials cleared, and rows with pending sandbox cleanup are kept
+    as tombstones instead of being dropped.
+    """
+    workspace_id = current_workspace_id()
+    session.execute(
+        update(SqlScheduledTask)
+        .where(
+            SqlScheduledTask.workspace_id == workspace_id,
+            SqlScheduledTask.user_id == user_id,
+            SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+        )
+        .values(state=encode_scheduled_task_state("deleted"), updated_at=now)
+    )
+    session.execute(
+        update(SqlDeviceGrant)
+        .where(
+            SqlDeviceGrant.workspace_id == workspace_id,
+            SqlDeviceGrant.user_id == user_id,
+            SqlDeviceGrant.status != encode_device_grant_status("revoked"),
+        )
+        .values(
+            status=encode_device_grant_status("revoked"),
+            refresh_token_hash=None,
+            prev_refresh_token_hash=None,
+        )
+    )
+    # Row locks serialize this cleanup with managed-sandbox replacement,
+    # like HostStore.delete_host: classifying then acting on unlocked rows
+    # would let a host gain a sandbox between the two statements and escape
+    # both. SQLite ignores FOR UPDATE; its write transaction already locks.
+    host_rows = (
+        session.execute(
+            select(SqlHost)
+            .where(
+                SqlHost.workspace_id == workspace_id,
+                SqlHost.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    if not host_rows:
+        return
+    session.execute(
+        update(SqlConversationMetadata)
+        .where(
+            SqlConversationMetadata.workspace_id == workspace_id,
+            SqlConversationMetadata.host_id.in_([row.host_id for row in host_rows]),
+        )
+        .values(host_id=None)
+    )
+    doomed: list[str] = []
+    for row in host_rows:
+        pending_cleanup = row.sandbox_provider is not None and (
+            row.sandbox_id is not None or row.terminating_sandbox_id is not None
+        )
+        if pending_cleanup:
+            row.token_hash = None
+            row.token_expires_at = None
+            row.status = encode_host_status("offline")
+            row.deleted_at = row.deleted_at or now
+            row.updated_at = now
+        else:
+            doomed.append(row.host_id)
+    if doomed:
+        session.execute(
+            delete(SqlHost).where(
+                SqlHost.workspace_id == workspace_id,
+                SqlHost.host_id.in_(doomed),
+            )
+        )
 
 
 def _to_account_token(row: SqlAccountToken) -> AccountToken:
@@ -271,16 +360,26 @@ class SqlAlchemyAccountStore:
         return list(session.execute(query).scalars().all())
 
     def delete_user(self, user_id: str) -> bool | None:
-        """Delete a user row and their permission grants, refusing to
-        remove the last admin.
+        """Delete a user row and every durable authority it owns,
+        refusing to remove the last admin.
 
-        Explicitly deletes all ``session_permissions`` rows for the user
-        before removing the user row — the DB no longer cascades this.
+        In the same transaction as the user-row delete this also removes
+        the user's ``session_permissions`` rows, marks their scheduled
+        tasks ``deleted`` (so the scheduler never fires them again),
+        revokes their device/refresh grants (so no further access tokens
+        can be minted), and deletes or tombstones their hosts (so an
+        unattended run has nowhere to land). Because everything shares
+        one transaction, a partial failure rolls back the whole delete
+        rather than leaving authority behind.
+
         The admin-invariant check and the delete run in the same locked
         transaction (see :meth:`_locked_admin_ids`), so this is atomic
         against a concurrent delete of a different admin — unlike a
         plain read-then-delete, the two can't both observe "an admin
         remains" and both apply.
+
+        Outstanding session JWTs are not stored server-side; callers
+        invalidate them via :meth:`UnifiedAuthProvider.revoke_user_sessions`.
 
         :returns: ``True`` if deleted, ``False`` if refused because
             ``user_id`` is the last remaining admin, ``None`` if no such
@@ -288,7 +387,16 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> bool | None:
-            target = session.get(SqlUser, (current_workspace_id(), user_id))
+            # Lock the user row first so authority issuance that also locks
+            # it (e.g. DeviceGrantStore.create_redeemed_grant) fully
+            # serializes with the delete: a grant committed before this
+            # lock is seen by the revocation below; one that waits on it
+            # finds the row gone and refuses.
+            target = session.get(
+                SqlUser,
+                (current_workspace_id(), user_id),
+                with_for_update=True if self._supports_for_update else None,
+            )
             if target is None:
                 return None
             if target.is_admin:
@@ -301,6 +409,7 @@ class SqlAlchemyAccountStore:
                     SqlSessionPermission.user_id == user_id,
                 )
             )
+            _revoke_durable_authority(session, user_id, now=int(time.time()))
             session.delete(target)
             return True
 
