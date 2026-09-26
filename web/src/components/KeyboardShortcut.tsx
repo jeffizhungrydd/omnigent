@@ -14,16 +14,16 @@ export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 
-export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
-  return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
+export function composerSendShortcutKeys(): string[] {
+  return [ENTER_KEY];
 }
 
 export function composerSteerAllShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, SHIFT_KEY, ENTER_KEY] : [MOD_KEY, ENTER_KEY];
 }
 
-export function composerNewLineShortcutKeys(submitWithModEnter: boolean): string[] {
-  return submitWithModEnter ? [ENTER_KEY] : [SHIFT_KEY, ENTER_KEY];
+export function composerNewLineShortcutKeys(): string[] {
+  return [SHIFT_KEY, ENTER_KEY];
 }
 
 export function Kbd({

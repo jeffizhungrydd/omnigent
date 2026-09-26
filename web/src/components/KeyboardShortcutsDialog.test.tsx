@@ -47,12 +47,13 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
   });
 
-  it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
+  it("adds Ctrl+Enter as an alternate send chord and keeps Shift+Enter for a new line", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     render(<KeyboardShortcutsList />);
 
-    expect(keysFor("Send message")).toEqual(["Ctrl", "↵"]);
-    expect(keysFor("New line in message")).toEqual(["↵"]);
+    expect(keysFor("Send message")).toEqual(["↵"]);
+    expect(keysFor("Send message (alternate)")).toEqual(["Ctrl", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
   });
 
   it("does not advertise inactive composer chords on touch-primary devices", () => {

@@ -37,17 +37,12 @@ export function writeSubmitWithModEnter(value: boolean): void {
   }
 }
 
-export function isComposerSendKey(
-  event: ComposerSendKeyEvent,
-  submitWithModEnter: boolean,
-  isMobile: boolean,
-): boolean {
+export function isComposerSendKey(event: ComposerSendKeyEvent, isMobile: boolean): boolean {
   if (isMobile || event.key !== "Enter" || event.isComposing || event.shiftKey || event.altKey) {
     return false;
   }
 
-  const hasMod = event.metaKey === true || event.ctrlKey === true;
-  return submitWithModEnter ? hasMod : true;
+  return true;
 }
 
 /**

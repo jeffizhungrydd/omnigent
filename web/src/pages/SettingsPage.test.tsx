@@ -401,10 +401,10 @@ describe("SettingsPage", () => {
     if (description === null) throw new Error("Missing composer shortcut description");
     expect(Array.from(description.children).map((line) => line.tagName)).toEqual(["P", "P"]);
     expect(
-      within(description).getByText("Off: Enter submits and Shift+Enter inserts a newline."),
+      within(description).getByText("Enter submits. Shift+Enter inserts a newline."),
     ).toBeInTheDocument();
     expect(
-      within(description).getByText(/On: Enter inserts a newline and (?:⌘|Ctrl)\+Enter submits\./),
+      within(description).getByText(/On: (?:⌘|Ctrl)\+Enter also submits\./),
     ).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-labelledby");
     expect(toggle).toHaveAccessibleName(/Submit with (?:⌘|Ctrl) \+ Enter on desktop/);
