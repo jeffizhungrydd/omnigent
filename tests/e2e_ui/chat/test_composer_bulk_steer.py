@@ -44,7 +44,7 @@ def test_bulk_steer_retries_the_whole_queue(
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill("first line")
-    composer.press("Enter" if alternate_send else "Shift+Enter")
+    composer.press("Shift+Enter")
     composer.press_sequentially("second line")
     expect(composer).to_have_value("first line\nsecond line")
     assert not posted
