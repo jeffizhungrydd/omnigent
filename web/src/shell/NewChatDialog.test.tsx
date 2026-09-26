@@ -5612,22 +5612,22 @@ describe("NewChatLandingScreen", () => {
     });
   });
 
-  it("uses Mod+Enter to start a session when the alternate composer behavior is enabled", async () => {
-    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding();
-    const input = screen.getByTestId("new-chat-landing-input");
-    fireEvent.change(input, { target: { value: "run the build" } });
+  it.each([false, true])(
+    "starts a session with Enter when the modifier preference is enabled (mod=%s)",
+    async (withModifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "run the build" } });
 
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(authenticatedFetchMock).not.toHaveBeenCalled();
-
-    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-  });
+      fireEvent.keyDown(input, { key: "Enter", metaKey: withModifier });
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    },
+  );
 
   it.each([false, true])(
     "suppresses IME creation and then sends once with submitWithModEnter=%s",

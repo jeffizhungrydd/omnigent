@@ -6773,7 +6773,7 @@ export function NewChatLandingScreen() {
                         ) : !creating && !preventsKeyboardSubmit ? (
                           <KeyboardShortcutTooltipContent
                             label="Start session"
-                            keys={composerSendShortcutKeys(submitWithModEnter)}
+                            keys={composerSendShortcutKeys()}
                           />
                         ) : null}
                       </Tooltip>
