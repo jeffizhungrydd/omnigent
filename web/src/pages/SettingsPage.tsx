@@ -1470,10 +1470,8 @@ function ComposerSendShortcutControl() {
           Submit with {MOD_KEY} + Enter on desktop
         </span>
         <div id={descriptionId} className="text-ui text-muted-foreground">
-          <p>Enter submits. Shift+Enter inserts a newline.</p>
-          <p>
-            On: {MOD_KEY}+Enter also submits. Use {MOD_KEY}+Shift+Enter to send queued messages.
-          </p>
+          <p>Off: Enter submits and Shift+Enter inserts a newline.</p>
+          <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
         </div>
       </div>
       <Switch

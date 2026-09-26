@@ -1,4 +1,4 @@
-"""E2E: the local Composer submit shortcut persists and adds Mod+Enter as a send chord."""
+"""E2E: the local Composer submit shortcut persists and controls submission."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _screenshot(page: Page) -> None:
         page.screenshot(path=str(Path(shot_dir) / "composer-submit-shortcut.png"))
 
 
-def test_submit_with_mod_enter_persists_and_adds_a_send_gesture(
+def test_submit_with_mod_enter_persists_and_is_the_only_send_gesture(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
@@ -81,7 +81,7 @@ def test_submit_with_mod_enter_persists_and_adds_a_send_gesture(
     composer = page.get_by_label(_COMPOSER_LABEL)
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill("first line")
-    composer.press("Shift+Enter")
+    composer.press("Enter")
     composer.type("second line")
     expect(composer).to_have_value("first line\nsecond line")
     page.wait_for_timeout(300)
@@ -91,11 +91,11 @@ def test_submit_with_mod_enter_persists_and_adds_a_send_gesture(
     _wait_for_posts(page, posts, 1)
     assert posts == ["first line\nsecond line"]
 
-    composer.fill("plain Enter still sends")
+    composer.fill("plain Enter stays multiline")
     composer.press("Enter")
-    _wait_for_posts(page, posts, 2)
-    assert posts == ["first line\nsecond line", "plain Enter still sends"]
-    expect(composer).to_have_value("")
+    expect(composer).to_have_value("plain Enter stays multiline\n")
+    page.wait_for_timeout(300)
+    assert posts == ["first line\nsecond line"]
 
     page.goto(f"{base_url}/settings/general")
     expect(page.get_by_test_id("composer-submit-with-mod-enter-toggle")).to_have_attribute(

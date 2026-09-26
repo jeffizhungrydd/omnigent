@@ -238,7 +238,7 @@ export function ComposerTextInput({
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
         const insertNewline =
           event.key === "Enter" &&
-          event.shiftKey &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
           !event.altKey &&
           !event.metaKey &&
           !event.ctrlKey;
@@ -249,6 +249,7 @@ export function ComposerTextInput({
             : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
         const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
@@ -258,22 +259,14 @@ export function ComposerTextInput({
         );
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,
-          shouldPreferSendOverCompletion:
-            keyboard.submitWithModEnter &&
-            (event.metaKey || event.ctrlKey) &&
-            shouldSubmitFromKeyboard,
+          shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
           shouldSteerAllFromKeyboard,
         });
         if (event.defaultPrevented) return;
-        if (insertNewline || listStartEdit) {
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
           event.preventDefault();
           const textarea = event.currentTarget;
-          const edit = listStartEdit ??
-            listEdit ?? {
-              start: textarea.selectionStart,
-              end: textarea.selectionEnd,
-              text: "\n",
-            };
           textarea.setRangeText(edit.text, edit.start, edit.end, "end");
           textarea.dispatchEvent(
             new InputEvent("input", { bubbles: true, inputType: "insertText", data: edit.text }),

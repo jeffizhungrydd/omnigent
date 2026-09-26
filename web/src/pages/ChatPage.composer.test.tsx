@@ -628,6 +628,7 @@ describe("Composer send shortcut", () => {
 
   it.each([
     [false, "{Shift>}{Enter}{/Shift}"],
+    [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
@@ -639,21 +640,20 @@ describe("Composer send shortcut", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("sends with both Enter and Mod+Enter when the alternate preference is restored", () => {
+  it("uses Mod+Enter after the alternate preference is restored", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
-
-    fireEvent.change(textarea(), { target: { value: "plain enter" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(onSend.mock.calls[0]?.[0]).toBe("plain enter");
-
     fireEvent.change(textarea(), { target: { value: "alternate shortcut" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+
     fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
-    expect(onSend.mock.calls[1]?.[0]).toBe("alternate shortcut");
+    expect(onSend.mock.calls[0]?.[0]).toBe("alternate shortcut");
   });
 
-  it("keeps Enter as the Send tooltip shortcut with the alternate preference", async () => {
+  it("shows the alternate Send shortcut in the button tooltip", async () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "ready to send" } });
@@ -664,7 +664,7 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
-    expect(tooltipKeys(tooltip)).toEqual(["↵"]);
+    expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
   it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {

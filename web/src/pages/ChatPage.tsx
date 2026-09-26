@@ -3989,7 +3989,7 @@ function ComposerImpl(
                   {!showInterruptButton && !preventsKeyboardSubmit && (
                     <KeyboardShortcutTooltipContent
                       label="Send"
-                      keys={composerSendShortcutKeys()}
+                      keys={composerSendShortcutKeys(submitWithModEnter)}
                     />
                   )}
                 </Tooltip>

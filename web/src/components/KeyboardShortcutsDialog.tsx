@@ -136,17 +136,14 @@ function shortcutGroupsFor(
       return {
         ...group,
         items: [
-          { label: "Send message", keys: composerSendShortcutKeys() },
-          ...(submitWithModEnter
-            ? [{ label: "Send message (alternate)", keys: [MOD_KEY, ENTER_KEY] }]
-            : []),
+          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
           {
             label: "Send now, with all queued messages",
             keys: composerSteerAllShortcutKeys(submitWithModEnter),
           },
           {
             label: "New line in message",
-            keys: composerNewLineShortcutKeys(),
+            keys: composerNewLineShortcutKeys(submitWithModEnter),
           },
           ...group.items,
         ],

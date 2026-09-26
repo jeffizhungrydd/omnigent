@@ -30,17 +30,6 @@ describe("ChatComposer", () => {
     return { input: screen.getByRole("textbox") as HTMLTextAreaElement, onKeyDown };
   }
 
-  it("inserts a newline with Shift+Enter without submitting", () => {
-    const { input, onKeyDown } = renderEditor("First line");
-    input.setSelectionRange(5, 5);
-    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
-    expect(input).toHaveValue("First\n line");
-    expect(onKeyDown).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
-    );
-  });
-
   it("indents list markers when typed with a space", () => {
     const { input } = renderEditor("1.");
     input.setSelectionRange(input.value.length, input.value.length);
@@ -80,12 +69,29 @@ describe("ChatComposer", () => {
     expect(input).toHaveValue("- First item\n");
   });
 
-  it("submits a list on plain Enter, including with the modifier shortcut enabled", () => {
-    const { input, onKeyDown } = renderEditor("  1. First item", true);
+  it("submits a list on plain Enter with the default shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item");
     input.setSelectionRange(input.value.length, input.value.length);
     fireEvent.keyDown(input, { key: "Enter" });
     expect(input).toHaveValue("  1. First item");
     expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: true }),
+    );
+  });
+
+  it("continues a list on plain Enter when Mod+Enter is the send shortcut", () => {
+    const { input, onKeyDown } = renderEditor("  1. First item", true);
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(onKeyDown).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ shouldSubmitFromKeyboard: false }),
+    );
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(input).toHaveValue("  1. First item\n  2. ");
+    expect(onKeyDown).toHaveBeenLastCalledWith(
       expect.anything(),
       expect.objectContaining({ shouldSubmitFromKeyboard: true }),
     );
@@ -222,7 +228,7 @@ describe("ChatComposer", () => {
     const input = screen.getByRole("textbox");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
-      shouldSubmitFromKeyboard: true,
+      shouldSubmitFromKeyboard: false,
       shouldPreferSendOverCompletion: false,
       shouldSteerAllFromKeyboard: false,
     });
