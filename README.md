@@ -21,6 +21,20 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 
 ---
 
+## Contents
+
+- [Why Omnigent?](#why-omnigent)
+- [Quick start](#quick-start)
+  1. [Install](#1-install)
+  2. [Start your first agent](#2-start-your-first-agent)
+  3. [Choose & switch models](#3-choose--switch-models)
+  4. [Deploy a server (and use it from your phone)](#4-deploy-a-server-and-use-it-from-your-phone)
+  5. [Collaborate with your team](#5-collaborate-with-your-team)
+  6. [Govern your agents with policies](#6-govern-your-agents-with-policies)
+- [Write your own agent](#write-your-own-agent)
+- [Telemetry](#telemetry)
+- [Contributing](#contributing)
+
 ## Why Omnigent?
 
 Omnigent lets you:
