@@ -139,11 +139,13 @@ import {
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useStaticSandboxPicker } from "@/hooks/useStaticSandboxPicker";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { StaticSandboxMenuSection, StaticSandboxPickerDialogs } from "./StaticSandboxMenuSection";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
@@ -2075,6 +2077,8 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  // The picked static sandbox's id, so a failed create returns to the same VM.
+  staticSandbox: string | null;
   sandboxRepoSelections: LastSandboxRepo[];
   workspace: string;
   branchName: string;
@@ -2178,6 +2182,8 @@ export function NewChatLandingScreen() {
     if (!c) return {};
     return {
       hostId: c.host_id,
+      staticSandboxId:
+        c.sandbox_target?.kind === "static" ? c.sandbox_target.sandbox_id : undefined,
       workspace: c.workspace,
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
@@ -2274,6 +2280,7 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          staticSandbox: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2390,6 +2397,13 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const staticPicker = useStaticSandboxPicker({
+    initialId: restoredDraft?.staticSandbox ?? null,
+    sandboxSelected,
+    message,
+    onSelect: () => selectSandbox(sandboxProvider ?? defaultSandboxProvider()),
+  });
+  const { setId: setStaticSandbox } = staticPicker;
   const hostSelected = !sandboxSelected && selectedHostId !== null;
   const rememberedHostChoice = readLastHostChoice();
   const executionTargetSelectionPending =
@@ -2640,6 +2654,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    staticSandbox: staticPicker.id,
     sandboxRepoSelections,
     workspace,
     branchName,
@@ -2769,6 +2784,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setStaticSandbox(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -2786,7 +2802,7 @@ export function NewChatLandingScreen() {
     setPickerEdits(null);
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project, prefillConfigSig]);
+  }, [projectParam, prefill.project, prefillConfigSig, setStaticSandbox]);
 
   // Record the config the machine settled from, once it's loaded and the
   // machine is done, so the reseed effect above can spot a later change to it
@@ -4586,15 +4602,21 @@ export function NewChatLandingScreen() {
       agents: agents === undefined || agentsArePlaceholder ? undefined : agentList,
       sandboxSelected,
       managedSandboxesEnabled,
+      staticSandboxesEnabled: staticPicker.enabled,
       selectedHostId,
       lastAgentId: readLastAgentId(),
       config: prefillConfig,
     });
     if (step === null) return;
     const { writes } = step;
-    if (writes.selectSandbox) {
+    // Not staticPicker.select(): a project default must not overwrite the remembered host.
+    if (writes.selectSandbox || writes.selectStaticSandbox !== undefined) {
       setSandboxSelected(true);
       setSandboxProvider(defaultSandboxProvider());
+    }
+    if (writes.selectStaticSandbox !== undefined) setStaticSandbox(writes.selectStaticSandbox);
+    if (writes.sandboxWorkspace !== undefined) {
+      setSandboxRepoSelections([splitSandboxWorkspace(writes.sandboxWorkspace)]);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -4625,6 +4647,8 @@ export function NewChatLandingScreen() {
     agentList,
     sandboxSelected,
     managedSandboxesEnabled,
+    staticPicker.enabled,
+    setStaticSandbox,
     selectedHostId,
     pickedAgentId,
     prefillConfig,
@@ -4986,7 +5010,8 @@ export function NewChatLandingScreen() {
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
-    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
+    staticPicker.selectedLabel ??
+    (sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel);
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
@@ -5152,6 +5177,7 @@ export function NewChatLandingScreen() {
     // Recorded even when already selected, so re-picking a different
     // provider still switches which one launches.
     setSandboxProvider(provider);
+    setStaticSandbox(null);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -5292,6 +5318,7 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) return;
+    const endStaticCreate = staticPicker.beginCreate();
     // A create is actually happening: report it for pointer clicks (via the
     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
     // don't emit, matching the disabled Start button.
@@ -5625,6 +5652,11 @@ export function NewChatLandingScreen() {
                         ? null
                         : undefined,
                 }),
+            // A static sandbox pick replaces the managed sandbox target.
+            ...staticPicker.createTarget(
+              composeSandboxWorkspaces(sandboxRepoSelections),
+              createProjectId !== null,
+            ),
             // Native-wrapper labels + codex bypass + the born-filed project
             // label (see `createLabels` above).
             // Smart Routing sends none of these: the bound agent is only a
@@ -5848,6 +5880,7 @@ export function NewChatLandingScreen() {
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
+      endStaticCreate();
       setCreating(false);
     }
   }
@@ -5864,6 +5897,7 @@ export function NewChatLandingScreen() {
   const cloudHosts = orderedHosts.filter(isCloudHostEntry);
   const localHosts = orderedHosts.filter((host) => !isCloudHostEntry(host));
   const hasCloudOptions =
+    staticPicker.enabled ||
     managedSandboxesEnabled ||
     showDisabledSandboxWithDocs ||
     cloudHosts.length > 0 ||
@@ -6650,6 +6684,7 @@ export function NewChatLandingScreen() {
                           pendingArcaConnectRef.current = false;
                           void connectArca();
                         }
+                        staticPicker.onMenuOpenChange(open);
                       }}
                     >
                       <DropdownMenuTrigger asChild>
@@ -6697,7 +6732,9 @@ export function NewChatLandingScreen() {
                                     : `new-chat-landing-sandbox-option-${provider}`
                                 }
                                 data-active={
-                                  sandboxSelected && sandboxProvider === provider
+                                  sandboxSelected &&
+                                  staticPicker.id === null &&
+                                  sandboxProvider === provider
                                     ? "true"
                                     : undefined
                                 }
@@ -6744,6 +6781,7 @@ export function NewChatLandingScreen() {
                               </Tooltip>
                             </DropdownMenuItem>
                           ))}
+                        <StaticSandboxMenuSection picker={staticPicker} />
                         {cloudHosts.map(renderHostMenuItem)}
                         {showArcaOption && (
                           <DropdownMenuItem
@@ -6964,6 +7002,7 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
+          <StaticSandboxPickerDialogs picker={staticPicker} />
           <WorkspacePickerDialog
             open={workspacePickerOpen}
             onOpenChange={setWorkspacePickerOpen}
