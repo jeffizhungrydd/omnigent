@@ -91,7 +91,8 @@ dependencies = [
     "zstandard>=0.22,<1",
     "tiktoken>=0.7,<1",
     # Server performance metrics use the no-op API even when tracing is off.
-    "opentelemetry-api>=1.20,<2",
+    # 1.23 added the histogram bucket advisory the server metrics pass at startup.
+    "opentelemetry-api>=1.23,<2",
     # The Claude Code and OpenAI Agents harnesses are part of the
     # baseline install — every CUJ command in the README depends on at
     # least one of them, so making them optional just forces every user
@@ -147,12 +148,14 @@ cockroachdb = [
 # CI / dev workflows still exercise.
 all = [
     "databricks-sdk>=0.56.0,<1",
-    "opentelemetry-sdk>=1.20,<2",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+    "opentelemetry-sdk>=1.23,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.23,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.23,<2",
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+    "opentelemetry-exporter-prometheus>=0.41b0,<1",
+    "prometheus-client>=0.17,<1",
 ]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
@@ -165,6 +168,13 @@ kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
 # lazily, so only users of this backend need the extra.
 s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# Prometheus pull endpoint for server metrics (OMNIGENT_PROMETHEUS_METRICS_ADDR,
+# omnigent/runtime/telemetry.py). Metrics only — no tracing exporters.
+prometheus = [
+    "opentelemetry-sdk>=1.23,<2",
+    "opentelemetry-exporter-prometheus>=0.41b0,<1",
+    "prometheus-client>=0.17,<1",
+]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -215,9 +225,9 @@ vault = ["hvac>=2,<3"]
 # OpenTelemetry tracing is opt-in so the exporters and automatic
 # instrumentors do not inflate the default install.
 tracing = [
-    "opentelemetry-sdk>=1.20,<2",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+    "opentelemetry-sdk>=1.23,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.23,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.23,<2",
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
