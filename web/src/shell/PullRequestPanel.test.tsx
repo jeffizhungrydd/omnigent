@@ -2,7 +2,7 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -49,7 +49,10 @@ const state = vi.hoisted(() => ({
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
   // Per-PR payloads the session list fetches for each row, keyed by PR URL.
-  rows: {} as Record<string, PullRequestInfo>,
+  // A function value defers or fails that PR's lookup.
+  rows: {} as Record<string, PullRequestInfo | (() => Promise<PullRequestInfo>)>,
+  // The session PR mutation (link / unlink), so tests can assert its calls.
+  mutate: vi.fn(),
 }));
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
@@ -65,11 +68,14 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     isFetching: false,
   }),
   fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
-  fetchPullRequestInfo: async (_conversationId: string, prUrl?: string) =>
-    state.rows[prUrl ?? ""] ?? { object: "session.github.info", available: true, pr: null },
+  fetchPullRequestInfo: async (_conversationId: string, prUrl?: string) => {
+    const row = state.rows[prUrl ?? ""];
+    if (typeof row === "function") return row();
+    return row ?? { object: "session.github.info", available: true, pr: null };
+  },
   // The account selector (shown in the repo-unresolved empty state) calls this;
   // stub the mutation shape it reads.
-  useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useUpdateSessionPr: () => ({ mutate: state.mutate, isPending: false, isError: false }),
   useSetPullRequestPreference: () => ({
     mutate: () => {},
     isPending: false,
@@ -109,6 +115,7 @@ import {
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
 } from "./PullRequestPanel";
+import { FIRST_LOAD_REVEAL_MS } from "./PullRequestList";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 const FORGE_DISPLAY = {
@@ -183,6 +190,7 @@ beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
   window.localStorage.clear();
   state.rows = {};
+  state.mutate = vi.fn();
   // Fire the observer callback immediately on observe so lazy sections mount.
   class IO {
     private cb: IntersectionObserverCallback;
@@ -847,7 +855,7 @@ describe("PullRequestPanel", () => {
       },
     );
 
-    it("is neutral above the PR list in a non-git workspace", () => {
+    it("is neutral above the PR list in a non-git workspace", async () => {
       const url = "https://github.com/acme/app/pull/6000";
       state.info = {
         data: {
@@ -875,7 +883,7 @@ describe("PullRequestPanel", () => {
       expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
       expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
       // The list names the PR in its own provider's style; the header does not.
-      const list = screen.getByRole("list", { name: "Session pull requests" });
+      const list = await screen.findByRole("list", { name: "Session pull requests" });
       expect(within(list).getByRole("button", { name: "acme/app #6000" })).toBeInTheDocument();
     });
 
@@ -1049,7 +1057,7 @@ describe("PullRequestPanel", () => {
         "placeholder",
         "Pull request URL",
       );
-      const list = screen.getByRole("list", { name: "Session pull requests" });
+      const list = await screen.findByRole("list", { name: "Session pull requests" });
       expect(
         within(list).getByRole("button", {
           name: "forge.example.test/contoso/web/app !7 — Add the widget",
@@ -1565,7 +1573,7 @@ describe("session PR selection", () => {
       },
     };
     const { rerender } = renderPanel();
-    const list = screen.getByRole("list", { name: "Session pull requests" });
+    const list = await screen.findByRole("list", { name: "Session pull requests" });
     const first = within(list).getByRole("button", { name: "example/one #42 — First repository" });
     const second = within(list).getByRole("button", {
       name: "example/two #42 — Second repository",
@@ -1610,7 +1618,7 @@ describe("session PR selection", () => {
 
   it.each([undefined, null, "", "   "])(
     "falls back to the PR identity when its title is %j",
-    (title) => {
+    async (title) => {
       const url = "https://github.com/example/one/pull/42";
       Object.assign(state.info!.data!, {
         tracking_available: true,
@@ -1627,13 +1635,13 @@ describe("session PR selection", () => {
         ],
       });
       renderPanel();
-      const row = screen.getByRole("button", { name: "example/one #42" });
+      const row = await screen.findByRole("button", { name: "example/one #42" });
       expect(row).toHaveTextContent(/^example\/one #42$/);
       expect(row).not.toHaveAttribute("title");
     },
   );
 
-  it("keeps the host and inferred marker alongside a trimmed PR title", () => {
+  it("keeps the host and inferred marker alongside a trimmed PR title", async () => {
     const url = "https://github.example.com/example/one/pull/42";
     Object.assign(state.info!.data!, {
       tracking_available: true,
@@ -1651,7 +1659,7 @@ describe("session PR selection", () => {
     });
     renderPanel();
     const label = "github.example.com/example/one #42 (from branch) — Fix session selection";
-    const row = screen.getByRole("button", { name: label });
+    const row = await screen.findByRole("button", { name: label });
     expect(row).toHaveTextContent(
       "github.example.com/example/one #42 (from branch) · Fix session selection",
     );
@@ -1698,7 +1706,7 @@ describe("session PR selection", () => {
       prs: entries.map(({ pr: _pr, ...association }) => association),
     });
     renderPanel();
-    const list = screen.getByRole("list", { name: "Session pull requests" });
+    const list = await screen.findByRole("list", { name: "Session pull requests" });
     const open = within(list).getByRole("button", { name: "example/app #2 — PR 2" });
     await waitFor(() =>
       expect(open).toHaveAccessibleDescription("Open. Checks: 1 failed, 2 passed"),
@@ -1716,6 +1724,119 @@ describe("session PR selection", () => {
     expect(
       within(finished).getByRole("button", { name: "example/app #3 — PR 3" }),
     ).toHaveAccessibleDescription("Merged");
+  });
+
+  describe("first load", () => {
+    const one = "https://github.com/example/app/pull/1";
+    const two = "https://github.com/example/app/pull/2";
+    const payload = (url: string, number: number, prState: string): PullRequestInfo => ({
+      object: "session.github.info",
+      available: true,
+      pr: { ...state.info!.data!.pr!, url, number, title: `PR ${number}`, state: prState },
+    });
+    const track = () =>
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: one,
+        prs: [one, two].map((url, index) => ({
+          url,
+          host: "github.com",
+          repository: "example/app",
+          number: index + 1,
+          title: `PR ${index + 1}`,
+          relationship: "attached" as const,
+        })),
+      });
+
+    it("reveals every PR's state in one batch", async () => {
+      let release!: () => void;
+      state.rows[one] = payload(one, 1, "OPEN");
+      state.rows[two] = () =>
+        new Promise((resolve) => {
+          release = () => resolve(payload(two, 2, "MERGED"));
+        });
+      track();
+      renderPanel();
+      expect(await screen.findByRole("status")).toHaveTextContent("Loading 2 pull requests…");
+      expect(screen.queryByRole("list", { name: "Session pull requests" })).toBeNull();
+      await act(async () => release());
+      const list = await screen.findByRole("list", { name: "Session pull requests" });
+      // Both states arrive together: no row renders before its neighbour resolved.
+      expect(
+        within(list).getByRole("button", { name: "example/app #1 — PR 1" }),
+      ).toHaveAccessibleDescription(expect.stringMatching(/^Open/));
+      expect(within(list).getByRole("button", { name: "Show 1 merged & closed" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+    });
+
+    it("counts a failed lookup as settled", async () => {
+      state.rows[one] = payload(one, 1, "OPEN");
+      state.rows[two] = () => Promise.reject(new Error("forge unavailable"));
+      track();
+      renderPanel();
+      const list = await screen.findByRole("list", { name: "Session pull requests" });
+      // The failed PR still lists under its identity, without a state of its own.
+      expect(
+        within(list).getByRole("button", { name: "example/app #2 — PR 2" }),
+      ).toHaveAccessibleDescription("Open");
+    });
+
+    it("shows what resolved once the deadline passes, leaving slow PRs loading", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      state.rows[one] = payload(one, 1, "OPEN");
+      state.rows[two] = () => new Promise(() => {});
+      track();
+      renderPanel();
+      expect(await screen.findByRole("status")).toHaveTextContent("Loading 2 pull requests…");
+      await act(() => vi.advanceTimersByTimeAsync(FIRST_LOAD_REVEAL_MS));
+      const list = await screen.findByRole("list", { name: "Session pull requests" });
+      expect(
+        within(list).getByRole("button", { name: "example/app #2 — PR 2" }),
+      ).toHaveAccessibleDescription("Loading");
+      expect(
+        within(list).getByRole("button", { name: "example/app #1 — PR 1" }),
+      ).toHaveAccessibleDescription(expect.stringMatching(/^Open/));
+    });
+  });
+
+  it("confirms an unlink, naming the PR it removes", async () => {
+    const user = userEvent.setup();
+    const url = "https://github.com/example/one/pull/42";
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      pr: { ...state.info!.data!.pr!, url, number: 42, title: "Fix session selection" },
+      prs: [
+        {
+          url,
+          host: "github.com",
+          repository: "example/one",
+          number: 42,
+          title: "Fix session selection",
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
+    const dialog = screen.getByRole("dialog", { name: "Unlink this pull request?" });
+    expect(dialog).toHaveTextContent("Fix session selection");
+    expect(within(dialog).getByRole("link", { name: "example/one #42" })).toHaveAttribute(
+      "href",
+      url,
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(state.mutate).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Unlink" }));
+    expect(state.mutate).toHaveBeenCalledWith({ url, action: "remove" }, expect.any(Object));
   });
 
   it("passes the selected PR and revisions into file queries", () => {

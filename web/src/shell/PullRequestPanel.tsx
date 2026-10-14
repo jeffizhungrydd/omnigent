@@ -58,6 +58,14 @@ import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -91,7 +99,7 @@ import {
   type PullRequestComment,
   type PullRequestInfo,
 } from "@/hooks/usePullRequests";
-import { PullRequestList } from "./PullRequestList";
+import { PullRequestList, pullRequestIdentity } from "./PullRequestList";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -898,6 +906,7 @@ function SidebarNode({
 export function PullRequestPanel({ conversationId }: { conversationId: string }) {
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [linking, setLinking] = useState(false);
+  const [confirmingUnlink, setConfirmingUnlink] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
@@ -938,6 +947,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
+  // An unlink failure is reported in its confirmation dialog, not beside the link form.
+  const unlinkFailed = update.isError && update.variables?.action === "remove";
+  const unlinkTitle =
+    (info.data?.selected_pr_url === selectedPr?.url ? info.data?.pr?.title : undefined)?.trim() ||
+    selectedPr?.title?.trim();
+  const unlinkIdentity = selectedPr ? pullRequestIdentity(selectedPr, associations?.provider) : "";
   const linkControls = (
     <>
       {linking && (
@@ -981,7 +996,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           </Button>
         </form>
       )}
-      {update.isError && (
+      {update.isError && !unlinkFailed && (
         <p role="alert" className="mt-1 text-ui text-destructive">
           {update.error.message}
         </p>
@@ -1026,14 +1041,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                   <IconButton
                     label="Unlink PR"
                     disabled={update.isPending}
-                    onClick={() =>
-                      update.mutate(
-                        { url: selected, action: "remove" },
-                        {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
-                        },
-                      )
-                    }
+                    onClick={() => setConfirmingUnlink(true)}
                   >
                     <Trash2Icon className="size-3.5" aria-hidden="true" />
                   </IconButton>
@@ -1047,11 +1055,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           <PanelTitle copy={copy} />
         </div>
       ) : null}
-      {showTrackingControls && (linking || update.isError) && (
+      {showTrackingControls && (linking || (update.isError && !unlinkFailed)) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
       {showTrackingControls && prs.length > 0 && (
         <PullRequestList
+          key={conversationId}
           conversationId={conversationId}
           associations={prs}
           sessionProvider={associations?.provider}
@@ -1067,6 +1076,69 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           {[...(info.data?.warnings ?? []), ...(info.data?.discovery_warnings ?? [])].join(" ")}
         </p>
       ) : null}
+      <Dialog
+        open={confirmingUnlink && !!selectedPr}
+        onOpenChange={(open) => {
+          if (!update.isPending) setConfirmingUnlink(open);
+        }}
+      >
+        <DialogContent showCloseButton={!update.isPending}>
+          <DialogHeader>
+            <DialogTitle>Unlink this {fallbackCopy.requestName}?</DialogTitle>
+            <DialogDescription>
+              This session stops tracking it, even if the agent works on it again. The{" "}
+              {fallbackCopy.requestName} itself is not changed on {fallbackCopy.label}, and you can
+              link it again at any time.
+            </DialogDescription>
+          </DialogHeader>
+          {selectedPr && (
+            <div className="min-w-0 rounded-md border border-border px-3 py-2">
+              {unlinkTitle && <p className="text-ui font-medium wrap-anywhere">{unlinkTitle}</p>}
+              <a
+                href={selectedPr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-muted-foreground wrap-anywhere hover:underline"
+              >
+                {unlinkIdentity}
+              </a>
+            </div>
+          )}
+          {unlinkFailed && (
+            <p role="alert" className="text-ui text-destructive">
+              {update.error.message}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              disabled={update.isPending}
+              onClick={() => setConfirmingUnlink(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={update.isPending}
+              disabled={update.isPending || !selected}
+              onClick={() =>
+                selected &&
+                update.mutate(
+                  { url: selected, action: "remove" },
+                  {
+                    onSuccess: (data) => {
+                      setConfirmingUnlink(false);
+                      changeSelection(data.selected_pr_url);
+                    },
+                  },
+                )
+              }
+            >
+              Unlink
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <div className="min-h-0 flex-1">
         <PullRequestPanelDetails
           key={`${conversationId}:${selected ?? ""}`}

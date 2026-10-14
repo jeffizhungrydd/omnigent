@@ -157,7 +157,8 @@ def test_session_pr_selection_and_unlink(
     pr_list = rail.get_by_role("list", name="Session pull requests")
     first_row = pr_list.get_by_role("button", name=one_label, exact=True)
     second_row = pr_list.get_by_role("button", name=two_label, exact=True)
-    expect(first_row).to_have_attribute("aria-current", "true")
+    # The second PR's lookup is held, so the first load reveals at its deadline.
+    expect(first_row).to_have_attribute("aria-current", "true", timeout=15_000)
     expect(first_row).not_to_have_attribute("title", re.compile(r".*"))
     original_list = pr_list.element_handle()
     assert original_list
@@ -223,10 +224,19 @@ def test_session_pr_selection_and_unlink(
     assert ("changes", two) in requested
     assert ("diff", two) in requested
     unlink_action.click()
+    confirm = page.get_by_role("dialog", name="Unlink this pull request?")
+    expect(confirm).to_contain_text("Second repository")
+    expect(confirm.get_by_role("link", name="example/two #42")).to_have_attribute("href", two)
+    page.screenshot(path=str(tmp_path / "session-pr-unlink-confirm.png"), animations="disabled")
+    confirm.get_by_role("button", name="Unlink", exact=True).click()
+    expect(confirm).to_have_count(0)
     expect(first_row).to_have_attribute("aria-current", "true")
     expect(second_row).to_have_count(0)
     expect(indicator).to_have_accessible_name("#42")
     unlink_action.click()
+    page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
+        "button", name="Unlink", exact=True
+    ).click()
     expect(pr_list).to_have_count(0)
     expect(indicator).to_have_count(0)
     expect(unlink_action).to_have_count(0)

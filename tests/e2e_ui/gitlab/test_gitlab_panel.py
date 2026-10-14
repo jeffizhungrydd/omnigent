@@ -267,6 +267,9 @@ def test_gitlab_link_select_unlink(
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     pr_list.get_by_role("button", name=re.compile(r"team/sub/other !12")).click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
+    page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
+        "button", name="Unlink", exact=True
+    ).click()
     expect(selected).to_have_accessible_name(re.compile(r"!7"))
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("!7")
     page.screenshot(path=str(tmp_path / "gitlab-selection.png"), animations="disabled")
@@ -295,6 +298,9 @@ def test_gitlab_unlink_last_mr_clears_selection(
         )
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
+    page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
+        "button", name="Unlink", exact=True
+    ).click()
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
     expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_have_count(0)
     expect(panel.get_by_role("link", name="Open the PR on GitLab")).to_have_count(0)

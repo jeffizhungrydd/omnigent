@@ -342,6 +342,9 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     pr_list.get_by_role("button", name=re.compile(r"contoso/web/other !12")).click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
+    page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
+        "button", name="Unlink", exact=True
+    ).click()
     expect(selected).to_have_accessible_name(re.compile(r"!7"))
     expect(page.get_by_test_id("composer-pr-link")).to_have_text("!7")
     page.screenshot(path=tmp_path / "azure-selection.png", animations="disabled")

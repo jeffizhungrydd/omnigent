@@ -2,7 +2,7 @@
 // first; merged and closed PRs sit behind a fold. Each row reads its PR through
 // the panel's own query key, so selecting a row reuses the cached PR page.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useQueries } from "@tanstack/react-query";
 import {
   ChevronRightIcon,
@@ -25,6 +25,13 @@ import {
   type PullRequest,
   type PullRequestAssociation,
 } from "@/hooks/usePullRequests";
+import {
+  runnerOfflineRetryDelay,
+  shouldRetryRunnerOffline,
+} from "@/hooks/useWorkspaceChangedFiles";
+
+/** The first load waits this long for every PR before showing what has resolved. */
+export const FIRST_LOAD_REVEAL_MS = 5_000;
 
 type Bucket = "open" | "merged" | "closed" | "loading";
 
@@ -42,15 +49,23 @@ function bucketOf(pr: PullRequest | null, pending: boolean): Bucket {
   return "open";
 }
 
-/** Each tracked PR's state and checks, one panel-keyed query per PR. */
+/**
+ * Each tracked PR's state and checks, one panel-keyed query per PR.
+ *
+ * The first load is revealed as one batch once every lookup has settled
+ * (a failure counts) or {@link FIRST_LOAD_REVEAL_MS} passes, so a slow or
+ * broken forge cannot hold the others back; later updates land row by row.
+ */
 function usePullRequestRows(
   conversationId: string,
   associations: PullRequestAssociation[],
-): PullRequestRow[] {
+): { rows: PullRequestRow[]; revealed: boolean } {
   const results = useQueries({
     queries: associations.map((association) => ({
       queryKey: ["github-info", conversationId, association.url],
       queryFn: () => fetchPullRequestInfo(conversationId, association.url),
+      retry: shouldRetryRunnerOffline,
+      retryDelay: runnerOfflineRetryDelay,
       staleTime: 30_000,
       // Running checks refresh here; settled PRs refresh on turn end like the panel.
       refetchInterval: (query: { state: { data?: { pr?: PullRequest | null } } }) => {
@@ -60,10 +75,20 @@ function usePullRequestRows(
       refetchIntervalInBackground: false,
     })),
   });
-  return associations.map((association, index) => {
+  const settled = results.every((result) => !result.isPending);
+  const [revealed, setRevealed] = useState(false);
+  useEffect(() => {
+    if (settled) setRevealed(true);
+  }, [settled]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setRevealed(true), FIRST_LOAD_REVEAL_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
+  const rows = associations.map((association, index) => {
     const pr = results[index]?.data?.pr ?? null;
     return { association, pr, bucket: bucketOf(pr, results[index]?.isPending ?? true) };
   });
+  return { rows, revealed: revealed || settled };
 }
 
 function stateVisual(row: PullRequestRow): { Icon: LucideIcon; label: string; className: string } {
@@ -123,7 +148,10 @@ function checkBuckets(pr: PullRequest | null) {
 }
 
 /** A PR's repository and number, e.g. ``"acme/app #12 (from branch)"``. */
-function pullRequestIdentity(pr: PullRequestAssociation, sessionProvider?: string | null): string {
+export function pullRequestIdentity(
+  pr: PullRequestAssociation,
+  sessionProvider?: string | null,
+): string {
   const copy = gitProviderCopy(pr.provider ?? sessionProvider, undefined, pr.provider_display);
   const host = pr.host === copy.defaultHost ? "" : `${pr.host}/`;
   const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
@@ -198,16 +226,8 @@ function Row({
 }
 
 /** Merged and closed PRs behind a toggle that slides open like the turn fold. */
-function FinishedSection({
-  count,
-  defaultOpen,
-  children,
-}: {
-  count: number;
-  defaultOpen: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
+function FinishedSection({ count, children }: { count: number; children: React.ReactNode }) {
+  const [open, setOpen] = useState(false);
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-1 px-3 py-2 text-xs text-muted-foreground hover:text-foreground">
@@ -242,7 +262,18 @@ export function PullRequestList({
   selectedUrl?: string;
   onSelect: (url: string) => void;
 }) {
-  const rows = usePullRequestRows(conversationId, associations);
+  const { rows, revealed } = usePullRequestRows(conversationId, associations);
+  if (!revealed) {
+    return (
+      <div className="shrink-0 border-b border-border py-1">
+        <p role="status" className="flex h-8 items-center gap-2 px-3 text-xs text-muted-foreground">
+          <Loader2Icon aria-hidden className="size-3.5 shrink-0 animate-spin" />
+          Loading{" "}
+          {associations.length === 1 ? "1 pull request" : `${associations.length} pull requests`}…
+        </p>
+      </div>
+    );
+  }
   const open = rows.filter((row) => row.bucket === "open" || row.bucket === "loading");
   // Merged before closed; each group keeps the session's order.
   const finished = [
@@ -266,10 +297,7 @@ export function PullRequestList({
           {renderRows(open)}
           {finished.length > 0 && (
             <li>
-              <FinishedSection
-                count={finished.length}
-                defaultOpen={finished.some((row) => row.association.url === selectedUrl)}
-              >
+              <FinishedSection count={finished.length}>
                 <ul aria-label="Merged and closed pull requests">{renderRows(finished)}</ul>
               </FinishedSection>
             </li>
