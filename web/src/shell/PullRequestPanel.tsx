@@ -71,7 +71,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -86,13 +85,13 @@ import {
   useSetPullRequestPreference,
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
-  type PullRequestAssociation,
   type PullRequestChangedFile,
   type PullRequestCheckRun,
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
 } from "@/hooks/usePullRequests";
+import { PullRequestList } from "./PullRequestList";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -135,7 +134,7 @@ function PullRequestEmptyState({
   );
 }
 
-/** Keep the provider name accessible without taking space from the PR picker. */
+/** Keep the provider name accessible without taking space from the PR list. */
 function PanelTitle({ copy }: { copy: GitProviderCopy }) {
   const Icon = copy.Icon;
   return (
@@ -896,22 +895,8 @@ function SidebarNode({
 }
 
 /** A PR's picker label, in its own provider's copy (else the session's). */
-function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string | null): string {
-  const copy = gitProviderCopy(pr.provider ?? sessionProvider, undefined, pr.provider_display);
-  const host = pr.host === copy.defaultHost ? "" : `${pr.host}/`;
-  const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
-  const identity = `${host}${pr.repository} ${copy.prNumberPrefix}${pr.number}${inferred}`;
-  const title = pr.title?.trim();
-  return title ? `${identity} — ${title}` : identity;
-}
-
 export function PullRequestPanel({ conversationId }: { conversationId: string }) {
-  const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [prPickerOpen, setPrPickerOpen] = useState(false);
-  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
-  // Select focuses rows on both pointer hover and keyboard navigation.
-  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
@@ -1029,73 +1014,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
           <PanelTitle copy={copy} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && (
-              <TooltipProvider>
-                <Select
-                  open={prPickerOpen}
-                  onOpenChange={(open) => {
-                    setPrPickerOpen(open);
-                    setPrPickerTooltipOpen(false);
-                    setFocusedPrUrl(undefined);
-                  }}
-                  value={selected ?? associations.selected_pr_url ?? ""}
-                  onValueChange={changeSelection}
-                >
-                  <Tooltip
-                    open={prPickerTooltipOpen && !prPickerOpen}
-                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
-                  >
-                    <TooltipTrigger asChild>
-                      <SelectTrigger
-                        aria-label="Session pull request"
-                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                    </TooltipTrigger>
-                    {selectedPr && (
-                      <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr, associations.provider)}
-                      </TooltipContent>
-                    )}
-                  </Tooltip>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width)"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
-                    }}
-                  >
-                    {prs.map((pr) => (
-                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
-                        <TooltipTrigger asChild>
-                          <SelectItem
-                            value={pr.url}
-                            onFocus={() => setFocusedPrUrl(pr.url)}
-                            onBlur={() =>
-                              setFocusedPrUrl((current) =>
-                                current === pr.url ? undefined : current,
-                              )
-                            }
-                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
-                          >
-                            {pullRequestLabel(pr, associations.provider)}
-                          </SelectItem>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side={isMobileViewport ? "bottom" : "left"}
-                          className="wrap-anywhere"
-                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
-                        >
-                          {pullRequestLabel(pr, associations.provider)}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </TooltipProvider>
-            )}
+            <span className="truncate text-xs text-muted-foreground">
+              {prs.length === 1 ? "1 pull request" : `${prs.length} pull requests`}
+            </span>
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <TooltipProvider delayDuration={0}>
                 <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
@@ -1128,6 +1049,15 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
+      )}
+      {showTrackingControls && prs.length > 0 && (
+        <PullRequestList
+          conversationId={conversationId}
+          associations={prs}
+          sessionProvider={associations?.provider}
+          selectedUrl={selected ?? associations?.selected_pr_url}
+          onSelect={changeSelection}
+        />
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
