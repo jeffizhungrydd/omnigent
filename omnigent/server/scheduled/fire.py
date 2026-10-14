@@ -59,6 +59,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.server import operation_metrics
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -991,6 +992,11 @@ def _record_run_sync(
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
+    operation_metrics.record_operation(
+        "scheduled_task_run",
+        max(0, now - scheduled_at),
+        operation_metrics.scheduled_run_outcome(status, error_code),
+    )
     update_fields: dict[str, Any] = {"last_run_at": now}
     if conversation_id is not None:
         update_fields["last_run_conversation_id"] = conversation_id

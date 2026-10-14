@@ -295,6 +295,23 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
 | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
 
+These two are independent of `OMNIGENT_TELEMETRY_ENABLED`: neither creates spans nor
+opens an outbound connection, so a deployment can turn them on without enabling export.
+
+| Variable | Example | Effect |
+|---|---|---|
+| `OMNIGENT_PROMETHEUS_METRICS_ADDR` | `127.0.0.1:9464` | Serves the server's OTel metrics as Prometheus text on `host:port/metrics` (pull only). Needs the `prometheus` extra. |
+| `OMNIGENT_LOG_FORMAT` | `json` | Docker entrypoint only: one JSON object per log line, keyed like Go `log/slog` (`time`, `level`, `msg`, `source`) plus request context (`trace_id`, `request_id`, `session_id`, `user_id`). Access lines drop query strings and `/health`. |
+
+With metrics on, the server records `omnigent.server.operation.duration` by
+`operation.name` (`session_create`, `event_post`, `sandbox_launch`, `sandbox_resume`,
+`scheduled_task_run`) and `outcome` (`ok`, `client_error`, `server_error`); the HTTP
+duration histogram carries the same `outcome`. Only `server_error` is the server's fault,
+so availability is `1 - server_error / total` over the histogram count. Also exported:
+`omnigent.server.errors` by `error.code`, and `omnigent.server.tunnel.active` /
+`.closed` by `tunnel.kind`. An incoming W3C `traceparent` becomes the request's ambient
+trace, so log lines carry the caller's `trace_id` even with export off.
+
 Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
 `OMNIGENT_TELEMETRY_ENABLED` is truthy, so a default install is never burdened with
 telemetry it didn't ask for. Opt in first, then point `OTEL_EXPORTER_OTLP_ENDPOINT` at a
