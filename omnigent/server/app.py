@@ -673,7 +673,8 @@ _TRACE_CONTEXT_PROPAGATOR = TraceContextTextMapPropagator()
 def _adopt_incoming_trace_context(request: Request) -> None:
     """Make the caller's W3C ``traceparent`` this request's ambient trace.
 
-    Log lines then carry the same ``trace_id`` as the proxy's, even with span
+    Log lines then carry the same ``trace_id`` as the caller that sent the
+    ``traceparent`` (a load balancer, gateway, or client), even with span
     export off. Skipped when instrumentation already started a span. Never
     detached: uvicorn runs each request in its own task, and the access log
     is emitted after this middleware returns.
