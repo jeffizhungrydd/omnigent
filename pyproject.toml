@@ -154,7 +154,7 @@ all = [
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
-    "opentelemetry-exporter-prometheus>=0.41b0,<1",
+    "opentelemetry-exporter-prometheus>=0.44b0,<1",
     "prometheus-client>=0.17,<1",
 ]
 # From omnigent.
@@ -172,7 +172,7 @@ s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # omnigent/runtime/telemetry.py). Metrics only — no tracing exporters.
 prometheus = [
     "opentelemetry-sdk>=1.23,<2",
-    "opentelemetry-exporter-prometheus>=0.41b0,<1",
+    "opentelemetry-exporter-prometheus>=0.44b0,<1",
     "prometheus-client>=0.17,<1",
 ]
 vertex = ["google-auth>=2.0,<3"]

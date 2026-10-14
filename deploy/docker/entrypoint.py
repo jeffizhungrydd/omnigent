@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 def _json_logging() -> bool:
     """Whether ``OMNIGENT_LOG_FORMAT=json`` asks for structured log lines."""
+    # Mirrors log_format.json_logging_requested without importing it (and OTel) eagerly.
     return os.environ.get("OMNIGENT_LOG_FORMAT", "").strip().lower() == "json"
 
 

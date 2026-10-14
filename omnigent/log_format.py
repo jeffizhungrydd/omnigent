@@ -55,10 +55,10 @@ _RESERVED_RECORD_ATTRS = frozenset(
 ) | {
     "message",
     "asctime",
-    # Display columns process_logging's filters set for text formats.
-    "trace_context",
+    # Display columns omnigent.process_logging's filter sets for text formats.
     "source_name",
     "func_name",
+    # uvicorn's colorized copy of the message.
     "color_message",
 }
 

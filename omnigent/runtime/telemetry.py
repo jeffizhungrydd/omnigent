@@ -128,8 +128,7 @@ def prometheus_metrics_addr() -> str:
     Return the ``host:port`` to serve Prometheus metrics on, or ``""``.
 
     Set by ``OMNIGENT_PROMETHEUS_METRICS_ADDR``, e.g.
-    ``"127.0.0.1:9464"``. A deployment that scrapes the server (or has
-    a co-located process merge them into its own endpoint) sets it;
+    ``"127.0.0.1:9464"``. A deployment that scrapes the server sets it;
     the listener only answers pulls, so the process makes no outbound
     connection for metrics.
 
@@ -1142,8 +1141,8 @@ def _create_prometheus_metric_reader(addr: str) -> MetricReader:
     Start the Prometheus pull endpoint and return its metric reader.
 
     ``target_info`` is disabled: a scraper already labels every series
-    with its target, and a second ``target_info`` family would conflict
-    when this exposition is merged into another process's.
+    with its target, so the extra family would only repeat resource
+    attributes on every scrape.
 
     :param addr: ``host:port`` to bind, e.g. ``"127.0.0.1:9464"``.
     :returns: Reader to attach to the ``MeterProvider``.
