@@ -1652,7 +1652,9 @@ describe("session PR selection", () => {
     renderPanel();
     const label = "github.example.com/example/one #42 (from branch) — Fix session selection";
     const row = screen.getByRole("button", { name: label });
-    expect(row).toHaveTextContent("Fix session selection · github.example.com/example/one #42");
+    expect(row).toHaveTextContent(
+      "github.example.com/example/one #42 (from branch) · Fix session selection",
+    );
     expect(row).not.toHaveAttribute("title");
   });
 

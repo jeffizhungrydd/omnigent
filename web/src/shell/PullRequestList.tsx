@@ -170,8 +170,8 @@ function Row({
             >
               <Icon aria-hidden className={cn("size-3.5 shrink-0", className)} />
               <span className="min-w-0 flex-1 truncate text-xs">
-                {title && <span className="font-medium">{title} · </span>}
                 <span className="text-muted-foreground">{identity}</span>
+                {title && <span className="font-medium"> · {title}</span>}
               </span>
               {checks.length > 0 && (
                 <span aria-hidden className="flex shrink-0 items-center gap-2 text-xs tabular-nums">
