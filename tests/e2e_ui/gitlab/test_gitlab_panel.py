@@ -225,8 +225,12 @@ def test_gitlab_panel_summary_and_diff(
     expect(panel.get_by_role("heading", name="GitLab", exact=True)).to_be_visible()
     expect(panel.get_by_text("!7", exact=True)).to_be_visible()
     expect(panel.get_by_text("A widget from a nested GitLab project.", exact=True)).to_be_visible()
-    expect(panel.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
-    expect(panel.get_by_text(re.compile(r"1\s*pending"))).to_be_visible()
+    expect(
+        panel.get_by_role("tabpanel", name="Summary").get_by_text(re.compile(r"1\s*passed"))
+    ).to_be_visible()
+    expect(
+        panel.get_by_role("tabpanel", name="Summary").get_by_text(re.compile(r"1\s*pending"))
+    ).to_be_visible()
     expect(panel.get_by_role("combobox", name="GitHub account")).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"gitlab-{entry}-summary.png"), animations="disabled")
     pr_tabs = panel.get_by_role("tablist", name="Pull request")
@@ -263,9 +267,9 @@ def test_gitlab_link_select_unlink(
     selected = pr_list.locator('button[aria-current="true"]')
     expect(selected).to_have_accessible_name(re.compile(r"!12"))
     expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
-    pr_list.get_by_role("button", name=re.compile(r"team/sub/project !7")).click()
+    pr_list.get_by_role("button", name="team/sub/project !7").click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    pr_list.get_by_role("button", name=re.compile(r"team/sub/other !12")).click()
+    pr_list.get_by_role("button", name="team/sub/other !12").click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
     page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
         "button", name="Unlink", exact=True

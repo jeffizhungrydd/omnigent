@@ -292,7 +292,8 @@ export function PullRequestList({
     ));
   return (
     <div className="max-h-[40%] shrink-0 overflow-y-auto border-b border-border py-1">
-      <TooltipProvider delayDuration={300}>
+      {/* Rows sit edge to edge, so moving to a neighbour must not count as reaching the tooltip. */}
+      <TooltipProvider delayDuration={300} disableHoverableContent>
         <ul aria-label="Session pull requests">
           {renderRows(open)}
           {finished.length > 0 && (

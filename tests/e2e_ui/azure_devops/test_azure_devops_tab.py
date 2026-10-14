@@ -225,7 +225,9 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail.get_by_role("tab", name="Pull Requests").click()
 
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
-    expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
+    expect(
+        rail.get_by_role("tabpanel", name="Summary").get_by_text(re.compile(r"1\s*passed"))
+    ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
     pr_tabs = rail.get_by_role("tablist", name="Pull request")
     pr_tabs.get_by_role("tab", name="Comments", exact=True).click()
@@ -338,9 +340,9 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
         )
     ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-outside-workspace.png", animations="disabled")
-    pr_list.get_by_role("button", name=re.compile(r"contoso/web/app !7")).click()
+    pr_list.get_by_role("button", name="contoso/web/app !7").click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    pr_list.get_by_role("button", name=re.compile(r"contoso/web/other !12")).click()
+    pr_list.get_by_role("button", name="contoso/web/other !12").click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
     page.get_by_role("dialog", name=re.compile(r"^Unlink this ")).get_by_role(
         "button", name="Unlink", exact=True

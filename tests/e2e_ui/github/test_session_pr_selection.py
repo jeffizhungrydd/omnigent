@@ -301,7 +301,16 @@ def test_session_pr_list_long_title(
         ],
         "pr": {**_INFO["pr"], "url": url, "number": 42, "title": title},
     }
-    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+
+    def fulfill(route: Route) -> None:
+        # Each row loads its own PR; #43's details stay unavailable so its row keeps no title.
+        query = parse_qs(urlsplit(route.request.url).query)
+        if query.get("pr_url", [url])[0] == url:
+            route.fulfill(json=info)
+        else:
+            route.fulfill(json={**info, "pr": None})
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), fulfill)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
@@ -329,7 +338,8 @@ def test_session_pr_list_long_title(
         assert row_text.evaluate("element => element.scrollHeight <= element.clientHeight")
         assert row.evaluate("element => element.scrollWidth <= element.clientWidth")
         box = row.bounding_box()
-        assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
+        # Full-width rows share the rail content's 1px offset past the rail border.
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width + 1
     assert titled_row.locator(".truncate").evaluate(
         "element => element.scrollWidth > element.clientWidth"
     )
