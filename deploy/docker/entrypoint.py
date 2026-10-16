@@ -47,8 +47,63 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedSandboxDeployment
     from omnigent.stores.artifact_store import ArtifactStore
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+
+def _json_logging() -> bool:
+    """Whether ``OMNIGENT_LOG_FORMAT=json`` asks for structured log lines."""
+    # Mirrors log_format.json_logging_requested without importing it (and OTel) eagerly.
+    return os.environ.get("OMNIGENT_LOG_FORMAT", "").strip().lower() == "json"
+
+
+if _json_logging():
+    from omnigent.log_format import JsonFormatter
+
+    _json_handler = logging.StreamHandler(sys.stderr)
+    _json_handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[_json_handler], force=True)
+else:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-docker")
+
+
+def _uvicorn_log_config() -> dict[str, Any] | None:
+    """
+    Return uvicorn's ``log_config`` for JSON mode, or ``None`` for its default.
+
+    Routes ``uvicorn.error`` and ``uvicorn.access`` through the JSON
+    formatters and drops ``/health`` access lines.
+    """
+    if not _json_logging():
+        return None
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "json": {"()": "omnigent.log_format.JsonFormatter"},
+            "access": {"()": "omnigent.server.performance_metrics.JsonAccessFormatter"},
+        },
+        "filters": {
+            "no_health": {"()": "omnigent.server.performance_metrics.HealthCheckAccessFilter"},
+        },
+        "handlers": {
+            "default": {
+                "class": "logging.StreamHandler",
+                "formatter": "json",
+                "stream": "ext://sys.stderr",
+            },
+            "access": {
+                "class": "logging.StreamHandler",
+                "formatter": "access",
+                "filters": ["no_health"],
+                "stream": "ext://sys.stderr",
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"level": "INFO"},
+            "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+        },
+    }
+
 
 # Defaults live as module-level constants — the Dockerfile and
 # docker-compose.yaml both also set these, so the values here just
@@ -539,18 +594,26 @@ def main() -> None:
 
         import uvicorn
 
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
         from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
-        uvicorn.run(
+        log_config = _uvicorn_log_config()
+        config = uvicorn.Config(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
+            **({"log_config": log_config} if log_config is not None else {}),
             # This image serves external runners only, so every session rides a
             # tunnel: without the keepalive budget uvicorn's 20 s default closes
             # a busy-but-healthy one with 1011 after a client-path stall.
             **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the container alive until the orchestrator
+            # SIGKILLs it. Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
+        serve(config)
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
         # Keep the process alive briefly so the container log capture has time
