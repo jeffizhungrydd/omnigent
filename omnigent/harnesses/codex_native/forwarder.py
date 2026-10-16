@@ -501,6 +501,54 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    # Unified-exec terminals still running on the main thread, keyed by item
+    # id with the command as value. The TUI shows these as "N background
+    # terminals running"; idle edges carry the count so Omnigent shows them too.
+    running_terminals: dict[str, str] = field(default_factory=dict)
+    # Terminal count last mirrored, so edges stay unchanged until one runs.
+    posted_terminal_count: int = 0
+
+    def note_terminal_started(self, item: _JsonObject) -> None:
+        """
+        Track a unified-exec ``commandExecution`` whose process is now running.
+
+        :param item: Codex ``commandExecution`` item from ``item/started``.
+        :returns: None.
+        """
+        item_id = item.get("id")
+        if (
+            isinstance(item_id, str)
+            and item.get("processId")
+            and item.get("source") == "unifiedExecStartup"
+        ):
+            command = item.get("command")
+            self.running_terminals[item_id] = command if isinstance(command, str) else ""
+
+    def note_terminal_finished(self, item: _JsonObject) -> bool:
+        """
+        Stop tracking a ``commandExecution`` whose process exited.
+
+        :param item: Codex ``commandExecution`` item from ``item/completed``.
+        :returns: ``True`` when the item was a tracked running terminal.
+        """
+        item_id = item.get("id")
+        return isinstance(item_id, str) and self.running_terminals.pop(item_id, None) is not None
+
+    def background_tasks_for_edge(self) -> list[dict[str, object]] | None:
+        """
+        Describe the running terminals for an ``idle`` status edge.
+
+        :returns: One ``{"id", "type", "status", "command"}`` dict per terminal,
+            an empty list to clear a previously mirrored count, or ``None`` when
+            no terminal has been mirrored and none is running.
+        """
+        if not self.running_terminals and not self.posted_terminal_count:
+            return None
+        self.posted_terminal_count = len(self.running_terminals)
+        return [
+            {"id": item_id, "type": "shell", "status": "running", "command": command}
+            for item_id, command in self.running_terminals.items()
+        ]
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2173,6 +2221,7 @@ async def supervise_forwarder(
         try:
             async for event in client.iter_events():
                 try:
+                    previous_session_id = target.session_id
                     rotated = await _maybe_rotate_session_on_thread_started(
                         ap_client=ap_client,
                         target=target,
@@ -2181,6 +2230,9 @@ async def supervise_forwarder(
                         event=event,
                     )
                     if rotated:
+                        await _clear_rotated_terminals(
+                            ap_client, previous_session_id, forwarder_state
+                        )
                         forwarder_state.note_parent_rotation(target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -3076,7 +3128,8 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
-        elif isinstance(item, dict) and item.get("type") == "commandExecution":
+        elif isinstance(item, dict) and item.get("type") in _LIVE_TOOL_ITEM_TYPES:
+            forwarder_state.note_terminal_started(item)
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
             if call_id is not None:
                 forwarder_state.note_tool_call_posted(call_id)
@@ -3149,6 +3202,14 @@ async def _handle_event(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
         )
+        if not is_child and forwarder_state is not None:
+            await _maybe_post_terminal_finished(
+                client,
+                session_id=route_session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
 
 
 def _resolve_event_session(
@@ -3953,6 +4014,64 @@ async def _handle_completed_event(
     )
 
 
+async def _clear_rotated_terminals(
+    client: httpx.AsyncClient,
+    old_session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Drop the background-terminal count of a chat the TUI rotated away from.
+
+    After ``/new`` or ``/clear`` the TUI stops listing the old thread's
+    terminals, so the old chat must not keep showing them as running.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param old_session_id: Omnigent session the forwarder rotated away from.
+    :param forwarder_state: Forwarder state tracking running terminals.
+    :returns: None.
+    """
+    forwarder_state.running_terminals.clear()
+    background_tasks = forwarder_state.background_tasks_for_edge()
+    if background_tasks is not None:
+        await _post_status(client, old_session_id, "idle", background_tasks=background_tasks)
+
+
+async def _maybe_post_terminal_finished(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Update Omnigent's background-terminal count when a terminal exits between turns.
+
+    A terminal that outlives its turn exits after the idle edge was posted, so
+    the count it left behind must be corrected here. Mid-turn exits are carried
+    by the turn's own idle edge instead, so a running session is never marked idle.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param params: Codex ``item/completed`` params.
+    :param forwarder_state: Forwarder state tracking running terminals.
+    :returns: None.
+    """
+    item = params.get("item")
+    if not isinstance(item, dict) or item.get("type") != "commandExecution":
+        return
+    if not forwarder_state.note_terminal_finished(item):
+        return
+    state = read_bridge_state(bridge_dir)
+    if state is None or state.active_turn_id is not None:
+        return
+    background_tasks = forwarder_state.background_tasks_for_edge()
+    if background_tasks is None:
+        return
+    await _post_status(client, session_id, "idle", background_tasks=background_tasks)
+
+
 async def _handle_terminal_turn_boundary(
     client: httpx.AsyncClient,
     *,
@@ -4045,7 +4164,16 @@ async def _handle_terminal_turn_boundary_inner(
     )
     handled = terminal.handled
     if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            terminal.edge,
+            background_tasks=(
+                forwarder_state.background_tasks_for_edge()
+                if forwarder_state is not None and terminal.edge.status == "idle"
+                else None
+            ),
+        )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -6769,18 +6897,62 @@ def _image_generation_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCa
     )
 
 
+def _mcp_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
+    """
+    Build a tool call from a Codex ``mcpToolCall`` item.
+
+    Named ``mcp__<server>__<tool>`` like Claude's MCP calls, so the web UI
+    renders Omnigent's own ``sys_*`` tools the same way for both harnesses.
+
+    :param call_id: Codex item id, e.g. ``"exec-abc"``.
+    :param item: Codex ``mcpToolCall`` item, e.g.
+        ``{"server": "omnigent", "tool": "sys_session_get_info",
+        "arguments": {}, "status": "completed",
+        "result": {"content": [{"type": "text", "text": "{...}"}]},
+        "error": null}``.
+    :returns: Normalized tool call, or ``None`` when server or tool is missing.
+    """
+    server = item.get("server")
+    tool = item.get("tool")
+    if not isinstance(server, str) or not server or not isinstance(tool, str) or not tool:
+        _logger.warning("Codex mcpToolCall missing server/tool: call_id=%s", call_id)
+        return None
+    arguments = item.get("arguments")
+    texts: list[str] = []
+    result = item.get("result")
+    content = result.get("content") if isinstance(result, dict) else None
+    if isinstance(content, list):
+        texts = [
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+    error = item.get("error")
+    error_message = error.get("message") if isinstance(error, dict) else error
+    if isinstance(error_message, str) and error_message:
+        texts.append(error_message)
+    if not texts:
+        texts = [f"status: {item.get('status')}"]
+    return _CodexToolCall(
+        call_id=call_id,
+        name=f"mcp__{server}__{tool}",
+        arguments=arguments if isinstance(arguments, dict) else {},
+        output="\n".join(texts),
+    )
+
+
 # Codex built-in tool item types this forwarder mirrors into Omnigent history.
-# ``mcpToolCall`` is intentionally absent: its event shape has not been
-# verified, so it is logged-but-skipped rather than mirrored with guessed
-# fields. Add it here once its real shape is captured.
 _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "commandExecution": _command_execution_tool_call,
     "fileChange": _file_change_tool_call,
     "webSearch": _web_search_tool_call,
     "imageView": _image_view_tool_call,
     "imageGeneration": _image_generation_tool_call,
+    "mcpToolCall": _mcp_tool_call,
 }
 _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
+# Tool items whose call card is posted at ``item/started`` so it shows while running.
+_LIVE_TOOL_ITEM_TYPES = frozenset({"commandExecution", "mcpToolCall"})
 
 # Codex ``/review`` enter/exit thread items. The web UI has no dedicated
 # review-mode affordance, so these are mirrored as a visible assistant-message
@@ -6871,6 +7043,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    background_tasks: list[dict[str, object]] | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -6889,9 +7062,15 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param background_tasks: Terminals still running at this edge. When set,
+        the edge carries their count (``0`` clears Omnigent's tally) and detail.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if background_tasks is not None:
+        data["background_task_count"] = len(background_tasks)
+        if background_tasks:
+            data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -6914,6 +7093,8 @@ async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
+    *,
+    background_tasks: list[dict[str, object]] | None = None,
 ) -> None:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
@@ -6927,6 +7108,7 @@ async def _post_turn_status_edge(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
         be published.
+    :param background_tasks: Terminals still running, sent on ``idle`` edges.
     :returns: None.
     """
     if edge is None:
@@ -6954,6 +7136,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        background_tasks=background_tasks if edge.status == "idle" else None,
     )
 
 
