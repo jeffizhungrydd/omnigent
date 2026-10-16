@@ -17,7 +17,7 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.log_format import MAX_ATTR_CHARS, JsonFormatter, json_logging_requested
+from omnigent.log_format import MAX_ATTR_BYTES, JsonFormatter, json_logging_requested
 
 
 def _record(msg: str = "hello %s", *args: object, level: int = logging.INFO) -> logging.LogRecord:
@@ -105,11 +105,38 @@ def test_trace_id_from_active_span_context() -> None:
     assert entry["trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
 
 
-def test_values_are_bounded() -> None:
-    entry = _format(_record("%s", "x" * (MAX_ATTR_CHARS * 2)))
+@pytest.mark.parametrize(
+    ("value", "truncated"),
+    [
+        pytest.param("x" * (MAX_ATTR_BYTES * 2), True, id="ascii"),
+        pytest.param("😀" * MAX_ATTR_BYTES, True, id="unicode"),
+        pytest.param("\x00" * MAX_ATTR_BYTES, True, id="control-characters"),
+        pytest.param('"\\' * MAX_ATTR_BYTES, True, id="escaped-characters"),
+        pytest.param({"text": "😀" * MAX_ATTR_BYTES}, True, id="nested-unicode"),
+        pytest.param({"text": "\x00" * MAX_ATTR_BYTES}, True, id="nested-controls"),
+        pytest.param(["x" * 100] * 200, True, id="nested-many-values"),
+        pytest.param("x" * (MAX_ATTR_BYTES - 2), False, id="ascii-at-limit"),
+        pytest.param("😀" * ((MAX_ATTR_BYTES - 2) // 4), False, id="unicode-below-limit"),
+        pytest.param("\x00" * ((MAX_ATTR_BYTES - 2) // 6), False, id="controls-below-limit"),
+        pytest.param({"text": "😀" * 100}, False, id="small-nested-unicode"),
+    ],
+)
+def test_values_are_bounded(value: object, truncated: bool) -> None:
+    record = _record("%s", value)
+    record.payload = value
+    entry = _format(record)
 
-    assert len(str(entry["msg"])) == MAX_ATTR_CHARS
-    assert str(entry["msg"]).endswith("...[truncated]")
+    for key in ("msg", "payload"):
+        size = len(json.dumps(entry[key], ensure_ascii=False).encode("utf-8"))
+        assert size <= MAX_ATTR_BYTES
+        if truncated:
+            assert str(entry[key]).endswith("...[truncated]")
+            assert size >= MAX_ATTR_BYTES - 6
+        else:
+            assert entry[key] == (str(value) if key == "msg" else value)
+    if truncated:
+        # Independent values may together exceed the per-value budget.
+        assert len(json.dumps(entry, ensure_ascii=False).encode("utf-8")) > MAX_ATTR_BYTES
 
 
 def test_secrets_are_redacted() -> None:
