@@ -262,18 +262,19 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("retry_mode", ["none", "same_process", "restart"])
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wake", ["cron", "handback"])
 async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
-    tmp_path: Path, retry_mode: str
+    tmp_path: Path, retry_mode: str, wake: str
 ) -> None:
     """
-    The full wake pipeline: settle → quiet-poll promote → marked new turn.
+    The full wake pipeline: settle → quiet-poll promote → running new turn.
 
     Poll 1 forwards a turn; its Stop edge records the pending settle
     (covered by the status-events test — recorded directly here). Poll 2
-    is quiet and promotes the settle, persisting it. Poll 3 sees new
-    assistant entries — a cron firing writes no user entry — and must POST
-    the scheduled-wake marker ahead of the resumed output, all under a new
-    response id.
+    is quiet and promotes the settle, persisting it. Poll 3 sees a turn
+    Claude started on its own — a cron firing (no user entry, so the
+    scheduled-wake marker leads) or a sub-agent hand-back. It must post
+    ``running`` once, then the turn's items, all under a new response id.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -314,6 +315,7 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         if (
             retry_mode != "none"
             and not failed_marker
+            and payload["type"] == "external_conversation_item"
             and payload["data"]["item_data"].get("role") == "user"
         ):
             failed_marker = True
@@ -349,8 +351,26 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         assert dedupe.settled_response_id == turn_one_id
         assert quiet.settled_response_id == turn_one_id
 
-        # A cron firing appends assistant output with NO user entry.
+        # A cron firing appends assistant output with NO user entry; a
+        # hand-back appends the sub-agent's report first.
         with transcript_path.open("a", encoding="utf-8") as handle:
+            if wake == "handback":
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "handback",
+                            "isMeta": True,
+                            "origin": {
+                                "kind": "peer",
+                                "handback": True,
+                                "senderTaskId": "agent-1",
+                            },
+                            "message": {"role": "user", "content": "<agent-message>done"},
+                        }
+                    )
+                    + "\n"
+                )
             handle.write(
                 json.dumps(
                     {
@@ -393,20 +413,110 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
                 dedupe=dedupe,
             )
 
-    # No status POST: the transcript path publishes none (Claude's status file
-    # owns the badge). The wake is observable entirely in the items — a fresh
-    # turn id plus the marker ahead of the resumed output.
-    assert [request["type"] for request in requests] == ["external_conversation_item"] * len(
-        requests
-    )
+    # Claude's status file stays busy while a background agent lives, so the
+    # woken turn's start is announced from the transcript, ahead of its items.
+    status = requests[0]
+    statuses = [r for r in requests if r["type"] == "external_session_status"]
     items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    assert len(statuses) + len(items) == len(requests)
     if retry_mode != "none":
         assert items[0]["source_id"] == items[1]["source_id"]
         items = items[1:]
     wake_turn_id = items[0]["response_id"]
     assert wake_turn_id != turn_one_id
+    assert status["type"] == "external_session_status"
+    assert status["data"]["status"] == "running"
+    assert status["data"]["response_id"] == wake_turn_id
     assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
-    assert items[0]["item_data"]["content"] == [
-        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
-    ]
+    if wake == "cron":
+        assert items[0]["item_data"]["content"] == [
+            {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+        ]
     assert {item["response_id"] for item in items} == {wake_turn_id}
+
+
+async def test_prompt_after_a_settled_turn_announces_its_edges(tmp_path: Path) -> None:
+    """
+    A prompt typed while a background agent keeps the status file busy is announced.
+
+    An Esc fires no ``Stop``, so the announced turn is closed from its interrupt marker.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    records = [
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "go"}},
+        {
+            "type": "user",
+            "uuid": "interrupt",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+            },
+        },
+    ]
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    statuses: list[str] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_status":
+            statuses.append(payload["data"]["status"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(settled_response_id="resp_prev_turn"),
+        )
+
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [("unstopped", "resp_t"), ("settled", None), ("interrupted", None)],
+)
+def test_a_late_stop_is_attributed_to_the_turn_that_ended(
+    previous: str, expected: str | None
+) -> None:
+    """
+    A turn opened before the previous turn's ``Stop`` arrived does not take that Stop.
+
+    Back-to-back sub-agent hand-backs open the next turn before the hook for the
+    last one lands; stamping that Stop with the new turn settled it at once and
+    its reply read as a scheduled wake.
+    """
+
+    def user(source: str, text: str, response_id: str, **extra: Any) -> ClaudeTranscriptItem:
+        return ClaudeTranscriptItem(
+            source_id=f"{source}:0:message",
+            item_type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": text}], **extra},
+            response_id=response_id,
+            subagent_return_id="agent-1" if extra.get("is_meta") else None,
+        )
+
+    items = [user("handback", "<agent-message>done", "resp_h", is_meta=True)]
+    if previous == "interrupted":
+        items.insert(0, user("esc", "[Request interrupted by user]", "resp_esc"))
+    dedupe = forwarder._ForwardDedupeState(
+        pending_settled_response_id="resp_t" if previous == "settled" else None
+    )
+
+    forwarder._track_unstopped_turn(items, set(), dedupe, previous_response_id="resp_t")
+
+    assert dedupe.unstopped_response_id == expected

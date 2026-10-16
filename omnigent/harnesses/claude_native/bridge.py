@@ -842,6 +842,8 @@ class ClaudeTranscriptItem:
         must correlate it by text without draining unrelated pending input.
     :param failure_context: Explicit API-error evidence for diagnostic logging;
         kept outside model-visible conversation content.
+    :param background_task_id: Claude's id for a background shell this
+        tool result launched, e.g. ``"bhr10wb5b"``.
     """
 
     source_id: str
@@ -853,6 +855,7 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    background_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3257,6 +3260,7 @@ def read_transcript_items_since_with_position(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    stopped_response_id: str | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items from a line cursor and return byte position.
@@ -3318,6 +3322,7 @@ def read_transcript_items_since_with_position(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            stopped_response_id=stopped_response_id,
         )
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
@@ -3369,6 +3374,7 @@ def read_transcript_items_from_offset(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    stopped_response_id: str | None = None,
     include_sidechains: bool = False,
     legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
@@ -3442,6 +3448,7 @@ def read_transcript_items_from_offset(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            stopped_response_id=stopped_response_id,
             include_sidechains=include_sidechains,
         )
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
@@ -8056,6 +8063,7 @@ def _transcript_items_from_entry(
     agent_name: str,
     current_response_id: str | None,
     settled_response_id: str | None = None,
+    stopped_response_id: str | None = None,
     include_sidechains: bool = False,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -8115,6 +8123,8 @@ def _transcript_items_from_entry(
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
+            settled_response_id=settled_response_id,
+            stopped_response_id=stopped_response_id,
         )
     if role == "assistant":
         return _assistant_transcript_items_from_entry(
@@ -8809,6 +8819,8 @@ def _user_transcript_items_from_entry(
     record_offset: int | None,
     agent_name: str,
     current_response_id: str | None,
+    settled_response_id: str | None = None,
+    stopped_response_id: str | None = None,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
     Parse a Claude ``role=user`` transcript entry.
@@ -8821,6 +8833,11 @@ def _user_transcript_items_from_entry(
         items so the web UI can attribute the invocation.
     :param current_response_id: Response id for the active assistant
         turn; tool results keep this id.
+    :param settled_response_id: Response id of a turn whose ``Stop``
+        edge was already forwarded. A subagent hand-back arriving after
+        it opens its own turn instead of reading as a scheduled wake.
+    :param stopped_response_id: Turn whose ``Stop`` was forwarded but has
+        not settled yet; a hand-back after it opens its own turn too.
     :returns: Updated active response id and parsed user/tool-result
         items.
     """
@@ -8847,6 +8864,13 @@ def _user_transcript_items_from_entry(
         return current_response_id, []
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
+    # A hand-back after the parent's turn settled wakes a new turn; one that
+    # lands mid-turn stays in the active turn.
+    handback_wakes = (
+        return_id is not None
+        and current_response_id is not None
+        and current_response_id in (settled_response_id, stopped_response_id)
+    )
 
     # ``isCompactSummary: true`` is the continuation-summary user record
     # Claude writes right after it compacts its own context. It is the
@@ -8897,6 +8921,8 @@ def _user_transcript_items_from_entry(
                     subagent_return_id=return_id,
                 )
             )
+            if handback_wakes:
+                return fallback_response_id, items
             return (
                 None
                 if content.lstrip().startswith("<task-notification>")
@@ -9023,6 +9049,7 @@ def _user_transcript_items_from_entry(
                 },
                 response_id=response_id,
                 subagent_return_id=_completed_subagent_tool_id(entry),
+                background_task_id=_launched_background_task_id(entry),
             )
         )
         item_index += 1
@@ -9045,6 +9072,8 @@ def _user_transcript_items_from_entry(
                 ),
             ),
         )
+    if handback_wakes and items and not user_blocks:
+        return fallback_response_id, items
     return (None if saw_user_text else current_response_id), items
 
 
@@ -9411,6 +9440,15 @@ def _completed_subagent_tool_id(entry: _JsonObject) -> str | None:
         return None
     agent_id = result.get("agentId")
     return agent_id if isinstance(agent_id, str) and agent_id else None
+
+
+def _launched_background_task_id(entry: _JsonObject) -> str | None:
+    """Read the background shell id a ``run_in_background`` Bash result reports."""
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    task_id = result.get("backgroundTaskId")
+    return task_id if isinstance(task_id, str) and task_id else None
 
 
 def _tool_result_output(entry: _JsonObject, block: _JsonObject) -> str:

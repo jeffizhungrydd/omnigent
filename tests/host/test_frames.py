@@ -793,6 +793,7 @@ def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
         session_id="profile-session",
         harness="codex-native",
         inference_config=config,
+        superseded_runner_id="runner_previous",
     )
     decoded = decode_host_frame(encode_host_frame(frame))
     assert decoded == frame
