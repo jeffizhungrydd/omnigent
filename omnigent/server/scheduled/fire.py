@@ -992,25 +992,27 @@ def _record_run_sync(
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
-    operation_metrics.record_operation(
-        "scheduled_task_run",
-        max(0, now - scheduled_at),
-        operation_metrics.scheduled_run_outcome(status, error_code),
-    )
-    update_fields: dict[str, Any] = {"last_run_at": now}
-    if conversation_id is not None:
-        update_fields["last_run_conversation_id"] = conversation_id
-    deps.scheduled_task_store.update(task.id, **update_fields)
-    deps.scheduled_task_store.create_run(
-        _new_id(),
-        task.id,
-        status,
-        scheduled_at,
-        conversation_id=conversation_id,
-        fired_at=now,
-        error=error,
-        error_code=error_code,
-    )
+    outcome: operation_metrics.Outcome = "server_error"
+    try:
+        update_fields: dict[str, Any] = {"last_run_at": now}
+        if conversation_id is not None:
+            update_fields["last_run_conversation_id"] = conversation_id
+        deps.scheduled_task_store.update(task.id, **update_fields)
+        deps.scheduled_task_store.create_run(
+            _new_id(),
+            task.id,
+            status,
+            scheduled_at,
+            conversation_id=conversation_id,
+            fired_at=now,
+            error=error,
+            error_code=error_code,
+        )
+        outcome = operation_metrics.scheduled_run_outcome(status, error_code)
+    finally:
+        operation_metrics.record_operation(
+            "scheduled_task_run", max(0, int(time.time()) - scheduled_at), outcome
+        )
 
 
 async def _validate_fire_session_inputs(
