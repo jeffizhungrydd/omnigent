@@ -168,13 +168,6 @@ kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
 # lazily, so only users of this backend need the extra.
 s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
-# Prometheus pull endpoint for server metrics (OMNIGENT_PROMETHEUS_METRICS_ADDR,
-# omnigent/runtime/telemetry.py). Metrics only — no tracing exporters.
-prometheus = [
-    "opentelemetry-sdk>=1.23,<2",
-    "opentelemetry-exporter-prometheus>=0.44b0,<1",
-    "prometheus-client>=0.17,<1",
-]
 vertex = ["google-auth>=2.0,<3"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
@@ -222,8 +215,8 @@ kubernetes = ["kubernetes>=36,<37"]
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
 # only deployments that pick the Vault backend need this extra.
 vault = ["hvac>=2,<3"]
-# OpenTelemetry tracing is opt-in so the exporters and automatic
-# instrumentors do not inflate the default install.
+# OpenTelemetry exporters and instrumentors are opt-in. The tracing extra
+# also provides Prometheus pull metrics, independently enabled at runtime.
 tracing = [
     "opentelemetry-sdk>=1.23,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.23,<2",
@@ -231,6 +224,8 @@ tracing = [
     "opentelemetry-instrumentation-fastapi>=0,<1",
     "opentelemetry-instrumentation-httpx>=0,<1",
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+    "opentelemetry-exporter-prometheus>=0.44b0,<1",
+    "prometheus-client>=0.17,<1",
 ]
 agents-sdk = [
     "openai-agents>=0.1,<1",

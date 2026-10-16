@@ -3326,11 +3326,6 @@ openshell = [
 postgres = [
     { name = "psycopg", extra = ["binary"] },
 ]
-prometheus = [
-    { name = "opentelemetry-exporter-prometheus" },
-    { name = "opentelemetry-sdk" },
-    { name = "prometheus-client" },
-]
 s3 = [
     { name = "boto3" },
     { name = "botocore" },
@@ -3341,10 +3336,12 @@ slack = [
 tracing = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-exporter-prometheus" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-instrumentation-sqlalchemy" },
     { name = "opentelemetry-sdk" },
+    { name = "prometheus-client" },
 ]
 vault = [
     { name = "hvac" },
@@ -3463,7 +3460,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'all'", specifier = ">=1.23,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'tracing'", specifier = ">=1.23,<2" },
     { name = "opentelemetry-exporter-prometheus", marker = "extra == 'all'", specifier = ">=0.44b0,<1" },
-    { name = "opentelemetry-exporter-prometheus", marker = "extra == 'prometheus'", specifier = ">=0.44b0,<1" },
+    { name = "opentelemetry-exporter-prometheus", marker = "extra == 'tracing'", specifier = ">=0.44b0,<1" },
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'all'", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'tracing'", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'all'", specifier = ">=0,<1" },
@@ -3472,13 +3469,12 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'all'", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'tracing'", specifier = ">=0,<1" },
     { name = "opentelemetry-sdk", marker = "extra == 'all'", specifier = ">=1.23,<2" },
-    { name = "opentelemetry-sdk", marker = "extra == 'prometheus'", specifier = ">=1.23,<2" },
     { name = "opentelemetry-sdk", marker = "extra == 'tracing'", specifier = ">=1.23,<2" },
     { name = "packaging", specifier = ">=23,<26" },
     { name = "pexpect", marker = "sys_platform != 'win32'", specifier = ">=4.9,<5" },
     { name = "pillow", specifier = ">=12.2,<13" },
     { name = "prometheus-client", marker = "extra == 'all'", specifier = ">=0.17,<1" },
-    { name = "prometheus-client", marker = "extra == 'prometheus'", specifier = ">=0.17,<1" },
+    { name = "prometheus-client", marker = "extra == 'tracing'", specifier = ">=0.17,<1" },
     { name = "prompt-toolkit", specifier = ">=3.0,<4" },
     { name = "protobuf", specifier = ">=6,<8" },
     { name = "protobuf", marker = "extra == 'antigravity'", specifier = ">=7,<8" },
@@ -3504,7 +3500,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "prometheus", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
