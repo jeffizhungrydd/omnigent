@@ -326,11 +326,21 @@ class JsonAccessFormatter(JsonFormatter):
 class HealthCheckAccessFilter(logging.Filter):
     """Drop access records for ``/health``, the probes' and sidebar's poll."""
 
+    def __init__(self, name: str = "", *, base_path: str | None = None) -> None:
+        """Match health paths using the server's configured deployment prefix."""
+        from omnigent.server.app import _normalize_base_path
+
+        super().__init__(name)
+        prefix = _normalize_base_path(
+            base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+        )
+        self._health_paths = frozenset(("/health", f"{prefix}/health"))
+
     def filter(self, record: logging.LogRecord) -> bool:
         """Return ``False`` for a ``/health`` access record."""
         args = record.args
         if isinstance(args, tuple) and len(args) == 5:
-            return str(args[2]).split("?", 1)[0] != "/health"
+            return str(args[2]).split("?", 1)[0] not in self._health_paths
         return True
 
 

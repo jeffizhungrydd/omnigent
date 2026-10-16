@@ -999,13 +999,31 @@ def test_json_access_formatter_emits_request_fields() -> None:
     assert "duration_ms" not in json.loads(JsonAccessFormatter().format(_make_access_record()))
 
 
-def test_health_check_access_filter_drops_only_health() -> None:
-    """``/health`` access lines are dropped; everything else passes."""
+@pytest.mark.parametrize(
+    ("base_path", "path", "visible"),
+    [
+        ("", "/health?session_ids=conv_a", False),
+        ("/", "/health", False),
+        ("/proxy/6767", "/health", False),
+        ("/proxy/6767", "/proxy/6767/health?session_ids=conv_a", False),
+        (" proxy/6767/ ", "/proxy/6767/health", False),
+        ("", "/unconfigured/health", True),
+        ("/proxy/6767", "/proxy/67670/health", True),
+        ("/proxy/6767", "/v1/services/health", True),
+        ("/proxy/6767", "/proxy/6767/v1/services/health", True),
+    ],
+)
+def test_health_check_access_filter_drops_only_health(
+    monkeypatch: pytest.MonkeyPatch, base_path: str, path: str, visible: bool
+) -> None:
+    """Root and configured-prefix probes are dropped; other health routes pass."""
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", base_path)
     health = _make_access_record()
-    health.args = ("10.0.0.1:0", "GET", "/health?session_ids=conv_a", "1.1", 200)
+    health.args = ("10.0.0.1:0", "GET", path, "1.1", 200)
 
-    assert HealthCheckAccessFilter().filter(health) is False
-    assert HealthCheckAccessFilter().filter(_make_access_record()) is True
+    access_filter = HealthCheckAccessFilter()
+    assert access_filter.filter(health) is visible
+    assert access_filter.filter(_make_access_record()) is True
 
 
 async def test_middleware_adopts_traceparent_and_labels_outcome(
