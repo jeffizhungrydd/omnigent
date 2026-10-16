@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
 from omnigent.harnesses.opencode_native.client import OpenCodeEvent
@@ -157,6 +158,51 @@ async def test_run_catches_up_on_reconnect_posts_gap_content() -> None:
     items = [b for _u, b in server.posts if b["type"] == "external_conversation_item"]
     texts = [item["data"]["item_data"]["content"][0]["text"] for item in items]
     assert texts == ["hello", "from gap"]
+
+
+@pytest.mark.parametrize(
+    ("finish", "expect_idle"),
+    [("stop", True), ("tool-calls", False), (None, False)],
+)
+async def test_reconnect_ends_turn_whose_idle_fell_in_the_gap(
+    finish: str | None, expect_idle: bool
+) -> None:
+    """A turn that finished while the SSE stream was down still gets its idle edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    info: dict[str, Any] = {"id": "msg_1", "role": "assistant", "time": {"completed": 1}}
+    if finish is not None:
+        info["finish"] = finish
+    part = {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "done"}
+    opencode.message_snapshots = [[], [{"info": info, "parts": [part]}]]
+    # The stream drops after the turn starts; session.idle is never delivered.
+    opencode._event_batches = [
+        [
+            _ev("message.updated", info={"id": "msg_1", "role": "assistant"}),
+            _ev("session.status", status={"type": "busy"}),
+            _ev("message.part.updated", part=part),
+        ],
+        [],
+    ]
+
+    async def _no_sleep(_s: float) -> None:
+        pass
+
+    orig_sleep = fwd_mod.asyncio.sleep
+    fwd_mod.asyncio.sleep = _no_sleep  # type: ignore[assignment]
+    try:
+        await fwd.run(max_reconnects=1)
+    finally:
+        fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+
+    statuses = [
+        (b["data"]["status"], b["data"].get("response_id"))
+        for _u, b in server.posts
+        if b["type"] == "external_session_status"
+    ]
+    assert statuses[0] == ("running", "msg_1")
+    assert (("idle", "msg_1") in statuses) is expect_idle
+    assert fwd.state.turn_active is not expect_idle
 
 
 async def test_catch_up_called_on_reconnect_not_initial_connect() -> None:

@@ -30,7 +30,11 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.harnesses.opencode_native.bridge import update_active_message_id
+from omnigent.harnesses.opencode_native.bridge import (
+    OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY,
+    update_active_message_id,
+    update_opencode_session_id,
+)
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
     OpenCodeClientError,
@@ -86,6 +90,18 @@ _MAX_DEDUPE_KEYS = 8192
 
 _JsonMapping: TypeAlias = Mapping[str, object]
 
+# Events handled for every session in the conversation's ``opencode serve``,
+# including ``task`` sub-agent sessions.
+_CONVERSATION_WIDE_EVENTS = frozenset(
+    {
+        "permission.asked",
+        "permission.v2.asked",
+        "question.asked",
+        "question.replied",
+        "question.rejected",
+    }
+)
+
 
 class _AssistantUsage(TypedDict):
     cost: float
@@ -139,6 +155,20 @@ def _message_is_complete(info: Mapping[str, Any] | None) -> bool:
     if not isinstance(time_info, Mapping):
         return False
     return isinstance(time_info.get("completed"), (int, float))
+
+
+def _assistant_turn_ended(info: Mapping[str, Any]) -> bool:
+    """Return whether a completed assistant message ends OpenCode's prompt loop.
+
+    OpenCode starts another step after ``tool-calls``/``unknown`` finishes, and
+    stops on any other finish reason or an error.
+    """
+    if info.get("role") != "assistant" or not _message_is_complete(info):
+        return False
+    if info.get("error"):
+        return True
+    finish = info.get("finish")
+    return isinstance(finish, str) and finish not in {"tool-calls", "unknown"}
 
 
 class OpenCodeNativeForwarder:
@@ -217,6 +247,15 @@ class OpenCodeNativeForwarder:
         # turn; both reset in :meth:`_end_turn`.
         self._active_message_id: str | None = None
         self._running_response_id: str | None = None
+        # Whether the active assistant message is still streaming. A prompt
+        # submitted meanwhile sorts after it natively, so its user text is
+        # held (part id -> part) until that message's text is flushed.
+        self._active_message_open = False
+        self._held_user_parts: dict[str, _JsonMapping] = {}
+        # OpenCode session id -> whether it is a top-level session. Only a
+        # top-level session can be the one the TUI shows (``/new`` or the session
+        # picker); child sessions belong to the ``task`` tool.
+        self._session_is_root: dict[str, bool] = {opencode_session_id: True}
         self._question_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def seed_dedupe_from_history(self) -> None:
@@ -268,7 +307,7 @@ class OpenCodeNativeForwarder:
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
 
-    async def catch_up_from_history(self) -> None:
+    async def catch_up_from_history(self, *, finish_missed_turn: bool = True) -> None:
         """
         Replay unseen persisted OpenCode parts after an SSE reconnect.
 
@@ -276,12 +315,16 @@ class OpenCodeNativeForwarder:
         persisted history and feed unseen parts through the same posting paths
         as live events, then let the normal dedupe keys suppress any duplicate
         live snapshots that arrive after reconnect.
+
+        :param finish_missed_turn: End a turn whose idle edge fell in the gap.
+            Off after a TUI session switch, where unseen history is not a gap.
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
         except Exception:  # noqa: BLE001 - catch-up is best effort.
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
             return
+        known_message_ids = set(self._msg_role)
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
@@ -320,6 +363,27 @@ class OpenCodeNativeForwarder:
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
             )
+        if finish_missed_turn:
+            await self._end_turn_missed_during_gap(messages, known_message_ids)
+
+    async def _end_turn_missed_during_gap(
+        self, messages: list[_JsonObject], known_message_ids: set[str]
+    ) -> None:
+        """End a turn whose ``session.idle`` fell in an SSE gap.
+
+        :param messages: Persisted session history, oldest first.
+        :param known_message_ids: Message ids seen before this catch-up.
+        """
+        last = messages[-1] if messages else None
+        info = last.get("info") if isinstance(last, Mapping) else None
+        if not isinstance(info, Mapping) or not _assistant_turn_ended(info):
+            return
+        message_id = info.get("id")
+        if not (self.state.turn_active or message_id not in known_message_ids):
+            return
+        if self._active_message_id is None and isinstance(message_id, str):
+            self._active_message_id = message_id
+        await self._end_turn()
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -366,6 +430,22 @@ class OpenCodeNativeForwarder:
             # loop exits (cap reached, return, or cancellation): cancel them all.
             await self._cancel_question_tasks()
 
+    async def fail_turn_after_server_exit(self, returncode: int | None) -> None:
+        """Close an open turn as failed once ``opencode serve`` has died.
+
+        :param returncode: The server's exit code, or ``None`` when unknown.
+        """
+        if not self.state.turn_active:
+            return
+        code = f" (exit code {returncode})" if returncode is not None else ""
+        await self._end_turn(
+            status=_STATUS_FAILED,
+            extra={
+                "output": f"OpenCode server stopped unexpectedly{code}. "
+                "Send a message or resume the session to restart it."
+            },
+        )
+
     async def _cancel_question_tasks(self) -> None:
         """Cancel and await every in-flight question park task."""
         tasks = list(self._question_tasks.values())
@@ -386,7 +466,10 @@ class OpenCodeNativeForwarder:
 
         :param event: A decoded OpenCode SSE event.
         """
-        if not self._event_targets_session(event):
+        await self._follow_tui_session(event)
+        # The serve is per conversation, so a ``task`` sub-agent's approval or
+        # question still belongs to it and must reach the policy gate / web card.
+        if event.type not in _CONVERSATION_WIDE_EVENTS and not self._event_targets_session(event):
             return
         handler = _HANDLERS.get(event.type)
         if handler is None:
@@ -418,6 +501,80 @@ class OpenCodeNativeForwarder:
         if session_id is None:
             return True
         return bool(session_id == self._opencode_session_id)
+
+    async def _follow_tui_session(self, event: OpenCodeEvent) -> None:
+        """Switch to the top-level session the TUI moved to (``/new`` or the picker).
+
+        The per-conversation ``opencode serve`` only gets new top-level sessions
+        from the TUI, so a new one, or a user prompt in another one, means the
+        TUI now shows it. Child sessions (``task`` sub-agents) never switch.
+        """
+        props = event.properties
+        target: str | None = None
+        if event.type == "session.created":
+            info = props.get("info")
+            if not isinstance(info, Mapping) or not isinstance(info.get("id"), str):
+                return
+            is_root = not info.get("parentID")
+            self._session_is_root[info["id"]] = is_root
+            if is_root:
+                target = info["id"]
+        elif event.type == "message.updated":
+            info = props.get("info")
+            if not isinstance(info, Mapping) or info.get("role") != "user":
+                return
+            session_id = info.get("sessionID")
+            if isinstance(session_id, str) and await self._is_root_session(session_id):
+                target = session_id
+        if target is not None and target != self._opencode_session_id:
+            await self._switch_session(target)
+
+    async def _is_root_session(self, session_id: str) -> bool:
+        known = self._session_is_root.get(session_id)
+        if known is not None:
+            return known
+        try:
+            session = await self._opencode.get_session(session_id)
+        except (httpx.HTTPError, OpenCodeClientError):
+            return False
+        is_root = session is not None and not session.parent_id
+        self._session_is_root[session_id] = is_root
+        return is_root
+
+    async def _switch_session(self, opencode_session_id: str) -> None:
+        """Retarget mirroring, web injection, and resume at *opencode_session_id*."""
+        previous = self._opencode_session_id
+        _logger.info(
+            "OpenCode TUI switched session for session=%s from=%s to=%s",
+            self._session_id,
+            previous,
+            opencode_session_id,
+        )
+        if self.state.turn_active or self._pending_text or self._held_user_parts:
+            await self._end_turn()
+        self._opencode_session_id = opencode_session_id
+        if self._bridge_dir is not None:
+            update_opencode_session_id(self._bridge_dir, opencode_session_id)
+        with contextlib.suppress(httpx.HTTPError):
+            await self._server.patch(
+                f"/v1/sessions/{quote(self._session_id, safe='')}",
+                json={"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: opencode_session_id}},
+                params={"include_usage": "false"},
+            )
+        await self._post_event(
+            _EXTERNAL_ITEM,
+            {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "opencode_session_switched",
+                    "message": "OpenCode switched to another session in the terminal.",
+                    "level": "info",
+                },
+            },
+        )
+        # A session picked from the TUI list may already hold unmirrored turns.
+        await self.catch_up_from_history(finish_missed_turn=False)
 
     # --- dedupe / keys ---------------------------------------------------
 
@@ -588,6 +745,10 @@ class OpenCodeNativeForwarder:
             merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
+        # Prompts held behind the finished reply follow its text, before the edge.
+        await self._flush_pending_text()
+        self._active_message_open = False
+        await self._release_held_user_parts()
         await self._post_status(status, extra=merged_extra)
         self._active_message_id = None
         self._running_response_id = None
@@ -609,10 +770,16 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
+            # Prompts queued before this message was created precede it.
+            await self._release_held_user_parts(before=message_id)
             # This turn's per-turn ``response_id`` — the running/idle edges carry
             # it so the web chat can correlate them with the tool-call items that
             # already stamp the same id (renders in-flight tool calls live).
             self._active_message_id = message_id
+            self._active_message_open = not _message_is_complete(info)
+            if not self._active_message_open:
+                await self._flush_pending_text()
+                await self._release_held_user_parts()
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
             await self._begin_turn_if_needed()
@@ -633,7 +800,7 @@ class OpenCodeNativeForwarder:
             # assistant turns with no/late user messages. Assistant text is
             # accumulated and finalized on step/turn end.
             if self._msg_role.get(str(part.get("messageID"))) == "user":
-                await self._post_user_text_part(part)
+                await self._post_or_hold_user_text_part(part)
             else:
                 self._accumulate_text_part(part)
         elif part_type == "tool":
@@ -648,6 +815,8 @@ class OpenCodeNativeForwarder:
             # A step's assistant text is complete once the step closes; flush
             # it so text and tool items land in the chat in step order.
             await self._flush_pending_text()
+            self._active_message_open = False
+            await self._release_held_user_parts()
 
     def _accumulate_text_part(self, part: _JsonMapping) -> None:
         """Record the latest full-text snapshot for an assistant text part.
@@ -670,6 +839,37 @@ class OpenCodeNativeForwarder:
             message_id if isinstance(message_id, str) else None,
             text,
         )
+
+    async def _post_or_hold_user_text_part(self, part: _JsonMapping) -> None:
+        """Post a user part, or hold it behind a still-streaming assistant message.
+
+        OpenCode orders messages by id, so a prompt queued mid-turn lands after
+        the in-flight assistant message whose text is only flushed at step end.
+        """
+        part_id = part.get("id")
+        message_id = part.get("messageID")
+        active = self._active_message_id
+        if (
+            self._active_message_open
+            and active is not None
+            and isinstance(part_id, str)
+            and isinstance(message_id, str)
+            and message_id > active
+        ):
+            self._held_user_parts[part_id] = part
+            return
+        await self._post_user_text_part(part)
+
+    async def _release_held_user_parts(self, *, before: str | None = None) -> None:
+        """Post held user parts in native order (only ids below *before* if given)."""
+        held = sorted(
+            self._held_user_parts.items(), key=lambda item: str(item[1].get("messageID"))
+        )
+        for part_id, part in held:
+            if before is not None and str(part.get("messageID")) >= before:
+                continue
+            self._held_user_parts.pop(part_id, None)
+            await self._post_user_text_part(part)
 
     async def _post_user_text_part(self, part: _JsonMapping) -> None:
         """Post a user message immediately so it precedes its assistant reply.

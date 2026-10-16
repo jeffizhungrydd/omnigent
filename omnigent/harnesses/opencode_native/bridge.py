@@ -46,6 +46,10 @@ OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_OPENCODE_NATIVE_REQUEST_SE
 # Label key recording the bridge id on the conversation, mirroring the
 # codex-native ``omnigent.codex_native.bridge_id`` label.
 OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.opencode_native.bridge_id"
+# Label recording the OpenCode session the TUI switched to (``/new`` or the
+# session picker). ``external_session_id`` is write-once, so a relaunch resumes
+# this one instead when set.
+OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY = "omnigent.opencode_native.active_session_id"
 
 # OpenCode server basic-auth env vars (see opencode ``attach``/``serve``).
 OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
@@ -701,6 +705,27 @@ def update_active_message_id(
             state,
             active_message_id=active_message_id,
             status=status if status is not None else state.status,
+        ),
+    )
+
+
+def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
+    """
+    Point web injection at the OpenCode session the TUI switched to.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param opencode_session_id: OpenCode session id now shown in the TUI.
+    :returns: None.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return
+    import dataclasses
+
+    write_bridge_state(
+        bridge_dir,
+        dataclasses.replace(
+            state, opencode_session_id=opencode_session_id, active_message_id=None, status="idle"
         ),
     )
 
