@@ -12,12 +12,14 @@ Request context (``trace_id``, ``request_id``, ``session_id``, ``runner_id``,
 ``user_id``) is added when bound, and any ``extra=`` fields ride as further
 top-level keys. Each serialized value is redacted and capped at
 :data:`MAX_ATTR_BYTES` UTF-8 bytes, including JSON quoting and escaping.
+Non-finite numbers are emitted as JSON ``null``, including in nested values.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import traceback
 from datetime import datetime, timezone
@@ -86,19 +88,24 @@ def _bounded(value: str) -> str:
 
 def _field_value(value: object) -> object:
     """Return a JSON-safe, bounded form of one extra field."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
         return _bounded(value)
     try:
-        encoded = json.dumps(value, default=str, ensure_ascii=False)
+        normalized = json.loads(
+            json.dumps(value, default=str, ensure_ascii=False), parse_constant=lambda _: None
+        )
+        encoded = json.dumps(normalized, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
         return _bounded(repr(value))
     # Nested structures stay structured (the pipeline flattens them) unless
     # they are oversized or carried a secret; then they degrade to text.
     if len(encoded.encode("utf-8")) > MAX_ATTR_BYTES or redact_log_text(encoded) != encoded:
         return _bounded(encoded)
-    return json.loads(encoded)
+    return normalized
 
 
 def _source(record: logging.LogRecord) -> str:
@@ -161,7 +168,9 @@ class JsonFormatter(logging.Formatter):
         if record.stack_info:
             entry["stack_info"] = record.stack_info
         return json.dumps(
-            {key: _field_value(value) for key, value in entry.items()}, ensure_ascii=False
+            {key: _field_value(value) for key, value in entry.items()},
+            ensure_ascii=False,
+            allow_nan=False,
         )
 
     def message(self, record: logging.LogRecord) -> str:

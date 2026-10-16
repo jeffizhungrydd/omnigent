@@ -301,7 +301,7 @@ opens an outbound connection, so a deployment can turn them on without enabling 
 | Variable | Example | Effect |
 |---|---|---|
 | `OMNIGENT_PROMETHEUS_METRICS_ADDR` | `127.0.0.1:9464` | Serves the server's OTel metrics as Prometheus text on `host:port/metrics` (pull only). Install with `uv pip install "omnigent[tracing]"`; enabling pull metrics does not enable tracing or OTLP export. The listener is per process: give each worker process its own address. |
-| `OMNIGENT_LOG_FORMAT` | `json` | Docker entrypoint only: one JSON object per log line, keyed like Go `log/slog` (`time`, `level`, `msg`, `source`) plus `logger` and request context (`trace_id`, `request_id`, `session_id`, `runner_id`, `user_id`). Each serialized field value is capped at 16 KiB of UTF-8, including JSON quoting and escaping. Access lines drop query strings and `/health`. |
+| `OMNIGENT_LOG_FORMAT` | `json` | Docker entrypoint only: one JSON object per log line, keyed like Go `log/slog` (`time`, `level`, `msg`, `source`) plus `logger` and request context (`trace_id`, `request_id`, `session_id`, `runner_id`, `user_id`). Each serialized field value is capped at 16 KiB of UTF-8, including JSON quoting and escaping. Non-finite numbers (`NaN`, positive and negative infinity) become `null`, including in nested values. Access lines drop query strings and `/health`. |
 
 With metrics on, the server records `omnigent.server.operation.duration` by
 `operation.name` (`session_create`, `event_post`, `sandbox_launch`, `sandbox_resume`,

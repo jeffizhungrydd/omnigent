@@ -35,7 +35,9 @@ def _record(msg: str = "hello %s", *args: object, level: int = logging.INFO) -> 
 def _format(record: logging.LogRecord) -> dict[str, object]:
     line = JsonFormatter().format(record)
     assert "\n" not in line
-    return json.loads(line)
+    return json.loads(
+        line, parse_constant=lambda token: pytest.fail(f"Nonstandard JSON constant: {token}")
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -106,22 +108,33 @@ def test_trace_id_from_active_span_context() -> None:
 
 
 @pytest.mark.parametrize(
-    ("value", "truncated"),
+    ("value", "truncated", "expected"),
     [
-        pytest.param("x" * (MAX_ATTR_BYTES * 2), True, id="ascii"),
-        pytest.param("😀" * MAX_ATTR_BYTES, True, id="unicode"),
-        pytest.param("\x00" * MAX_ATTR_BYTES, True, id="control-characters"),
-        pytest.param('"\\' * MAX_ATTR_BYTES, True, id="escaped-characters"),
-        pytest.param({"text": "😀" * MAX_ATTR_BYTES}, True, id="nested-unicode"),
-        pytest.param({"text": "\x00" * MAX_ATTR_BYTES}, True, id="nested-controls"),
-        pytest.param(["x" * 100] * 200, True, id="nested-many-values"),
-        pytest.param("x" * (MAX_ATTR_BYTES - 2), False, id="ascii-at-limit"),
-        pytest.param("😀" * ((MAX_ATTR_BYTES - 2) // 4), False, id="unicode-below-limit"),
-        pytest.param("\x00" * ((MAX_ATTR_BYTES - 2) // 6), False, id="controls-below-limit"),
-        pytest.param({"text": "😀" * 100}, False, id="small-nested-unicode"),
+        pytest.param("x" * (MAX_ATTR_BYTES * 2), True, ..., id="ascii"),
+        pytest.param("😀" * MAX_ATTR_BYTES, True, ..., id="unicode"),
+        pytest.param("\x00" * MAX_ATTR_BYTES, True, ..., id="control-characters"),
+        pytest.param('"\\' * MAX_ATTR_BYTES, True, ..., id="escaped-characters"),
+        pytest.param({"text": "😀" * MAX_ATTR_BYTES}, True, ..., id="nested-unicode"),
+        pytest.param({"text": "\x00" * MAX_ATTR_BYTES}, True, ..., id="nested-controls"),
+        pytest.param(["x" * 100] * 200, True, ..., id="nested-many-values"),
+        pytest.param("x" * (MAX_ATTR_BYTES - 2), False, ..., id="ascii-at-limit"),
+        pytest.param("😀" * ((MAX_ATTR_BYTES - 2) // 4), False, ..., id="unicode-below-limit"),
+        pytest.param("\x00" * ((MAX_ATTR_BYTES - 2) // 6), False, ..., id="controls-below-limit"),
+        pytest.param({"text": "😀" * 100}, False, ..., id="small-nested-unicode"),
+        pytest.param(float("nan"), False, None, id="nan"),
+        pytest.param(float("inf"), False, None, id="positive-infinity"),
+        pytest.param(float("-inf"), False, None, id="negative-infinity"),
+        pytest.param(
+            {"numbers": [float("nan"), float("inf"), {"value": float("-inf")}, 1.5]},
+            False,
+            {"numbers": [None, None, {"value": None}, 1.5]},
+            id="nested-non-finite",
+        ),
+        pytest.param((float("nan"), float("inf")), False, [None, None], id="tuple-non-finite"),
+        pytest.param(1.5, False, ..., id="finite-number"),
     ],
 )
-def test_values_are_bounded(value: object, truncated: bool) -> None:
+def test_values_are_bounded(value: object, truncated: bool, expected: object) -> None:
     record = _record("%s", value)
     record.payload = value
     entry = _format(record)
@@ -133,7 +146,8 @@ def test_values_are_bounded(value: object, truncated: bool) -> None:
             assert str(entry[key]).endswith("...[truncated]")
             assert size >= MAX_ATTR_BYTES - 6
         else:
-            assert entry[key] == (str(value) if key == "msg" else value)
+            payload = value if expected is ... else expected
+            assert entry[key] == (str(value) if key == "msg" else payload)
     if truncated:
         # Independent values may together exceed the per-value budget.
         assert len(json.dumps(entry, ensure_ascii=False).encode("utf-8")) > MAX_ATTR_BYTES
