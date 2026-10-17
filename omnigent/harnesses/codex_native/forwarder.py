@@ -353,6 +353,10 @@ class _PartialTextBuffer:
         return "".join(self.parts)
 
 
+# Display bound for a running terminal's command; heredocs can be huge.
+_TERMINAL_COMMAND_MAX_CHARS = 512
+
+
 @dataclass
 class _CodexForwarderState:
     """
@@ -522,7 +526,9 @@ class _CodexForwarderState:
             and item.get("source") == "unifiedExecStartup"
         ):
             command = item.get("command")
-            self.running_terminals[item_id] = command if isinstance(command, str) else ""
+            self.running_terminals[item_id] = (
+                command[:_TERMINAL_COMMAND_MAX_CHARS] if isinstance(command, str) else ""
+            )
 
     def note_terminal_finished(self, item: _JsonObject) -> bool:
         """
@@ -4033,7 +4039,7 @@ async def _clear_rotated_terminals(
     forwarder_state.running_terminals.clear()
     background_tasks = forwarder_state.background_tasks_for_edge()
     if background_tasks is not None:
-        await _post_status(client, old_session_id, "idle", background_tasks=background_tasks)
+        await _post_background_task_count(client, old_session_id, background_tasks)
 
 
 async def _maybe_post_terminal_finished(
@@ -4069,7 +4075,34 @@ async def _maybe_post_terminal_finished(
     background_tasks = forwarder_state.background_tasks_for_edge()
     if background_tasks is None:
         return
-    await _post_status(client, session_id, "idle", background_tasks=background_tasks)
+    await _post_background_task_count(client, session_id, background_tasks)
+
+
+async def _post_background_task_count(
+    client: httpx.AsyncClient,
+    session_id: str,
+    background_tasks: list[dict[str, object]],
+) -> None:
+    """
+    Publish a between-turns background-terminal count without completing a turn.
+
+    An ``external_session_status`` idle would settle the session's dispatched
+    work, so a sub-agent whose next message is already registered would finish
+    before its turn starts. ``subagent.status`` updates the idle indicator and
+    count without reaching the runner.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param background_tasks: Terminals still running; empty clears the count.
+    :returns: None.
+    """
+    data: _JsonObject = {"idle": True, "background_task_count": len(background_tasks)}
+    if background_tasks:
+        data["background_tasks"] = background_tasks
+    response = await _post_session_event(
+        client, session_id, event_type="subagent.status", data=data
+    )
+    _log_failed_session_event_post("subagent.status", response)
 
 
 async def _handle_terminal_turn_boundary(

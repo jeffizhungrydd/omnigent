@@ -37,6 +37,10 @@ def _statuses(client: _RecordingClient) -> list[dict]:
     return [body["data"] for _, body in client.posts if body["type"] == "external_session_status"]
 
 
+def _count_updates(client: _RecordingClient) -> list[dict]:
+    return [body["data"] for _, body in client.posts if body["type"] == "subagent.status"]
+
+
 async def _drive(tmp_path: Path, client: _RecordingClient, events: list[dict]) -> None:
     usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
     tracker = fwd._CodexElicitationTaskTracker()
@@ -81,7 +85,12 @@ _TURN_COMPLETED = {
 
 @pytest.mark.asyncio
 async def test_terminal_outliving_its_turn_is_counted_until_it_exits(tmp_path: Path) -> None:
-    """The TUI's "1 background terminal running" reaches Omnigent and clears on exit."""
+    """
+    The TUI's "1 background terminal running" reaches Omnigent and clears on exit.
+
+    The exit lands between turns, where a parent may already have dispatched the
+    next message, so it updates the count without posting another turn-ending idle.
+    """
     _bridge_state(tmp_path)
     client = _RecordingClient()
     background = _command("exec-bg", "/bin/bash -lc 'sleep 30'")
@@ -115,8 +124,8 @@ async def test_terminal_outliving_its_turn_is_counted_until_it_exits(tmp_path: P
             ],
             "response_id": "codex_turn_123",
         },
-        {"status": "idle", "background_task_count": 0},
     ]
+    assert _count_updates(client) == [{"idle": True, "background_task_count": 0}]
 
 
 @pytest.mark.asyncio
@@ -180,6 +189,7 @@ async def test_terminal_exiting_during_a_later_turn_does_not_idle_the_session(
     assert [s["status"] for s in statuses] == ["running", "idle", "running", "idle"]
     assert statuses[1]["background_task_count"] == 1
     assert statuses[3]["background_task_count"] == 0
+    assert _count_updates(client) == []
 
 
 @pytest.mark.asyncio
@@ -196,9 +206,20 @@ async def test_rotation_clears_the_old_chats_terminal_count() -> None:
         (
             "/v1/sessions/conv_old/events",
             {
-                "type": "external_session_status",
-                "data": {"status": "idle", "background_task_count": 0},
+                "type": "subagent.status",
+                "data": {"idle": True, "background_task_count": 0},
             },
         )
     ]
     assert state.background_tasks_for_edge() is None
+
+
+def test_running_terminal_command_is_bounded_for_display() -> None:
+    """A huge heredoc command is clamped in the detail but still counted."""
+    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    state.note_terminal_started(_command("exec-bg", "x" * 5000))
+
+    tasks = state.background_tasks_for_edge()
+
+    assert tasks is not None and len(tasks) == 1
+    assert tasks[0]["command"] == "x" * 512
