@@ -36,6 +36,7 @@ from omnigent.harnesses.opencode_native.bridge import (
     clear_web_prompt_pending,
     update_active_message_id,
     update_opencode_session_id,
+    web_prompt_message_id,
     web_prompt_pending,
 )
 from omnigent.harnesses.opencode_native.client import (
@@ -92,6 +93,8 @@ _OPENCODE_REAUTH_HINT = (
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
+# Web prompt message ids remembered after their pending marker is cleared.
+_MAX_WEB_MESSAGE_IDS = 64
 
 _JsonMapping: TypeAlias = Mapping[str, object]
 
@@ -264,6 +267,8 @@ class OpenCodeNativeForwarder:
         # top-level session can be the one the TUI shows (``/new`` or the session
         # picker); child sessions belong to the ``task`` tool.
         self._session_is_root: dict[str, bool] = {opencode_session_id: True}
+        # User message ids of web prompts, so their echoes never count as a TUI switch.
+        self._web_message_ids: OrderedDict[str, None] = OrderedDict()
         self._question_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def seed_dedupe_from_history(self) -> None:
@@ -521,7 +526,8 @@ class OpenCodeNativeForwarder:
 
         The per-conversation ``opencode serve`` only gets new top-level sessions
         from the TUI, so a new one, or a user prompt in another one, means the
-        TUI now shows it. Child sessions (``task`` sub-agents) never switch.
+        TUI now shows it. Child sessions (``task`` sub-agents) and web prompts
+        sent to a session the TUI has since left never switch.
         """
         props = event.properties
         target: str | None = None
@@ -537,11 +543,31 @@ class OpenCodeNativeForwarder:
             info = props.get("info")
             if not isinstance(info, Mapping) or info.get("role") != "user":
                 return
+            if self._is_web_prompt_message(info.get("id")):
+                return
             session_id = info.get("sessionID")
             if isinstance(session_id, str) and await self._is_root_session(session_id):
                 target = session_id
         if target is not None and target != self._opencode_session_id:
             await self._switch_session(target)
+
+    def _is_web_prompt_message(self, message_id: object) -> bool:
+        """Whether *message_id* is a web prompt's user message (pending or settled)."""
+        if not isinstance(message_id, str):
+            return False
+        self._remember_web_prompt_message()
+        return message_id in self._web_message_ids
+
+    def _remember_web_prompt_message(self) -> None:
+        """Keep the pending web prompt's message id past the marker's removal."""
+        if self._bridge_dir is None:
+            return
+        message_id = web_prompt_message_id(self._bridge_dir)
+        if message_id is None or message_id in self._web_message_ids:
+            return
+        self._web_message_ids[message_id] = None
+        while len(self._web_message_ids) > _MAX_WEB_MESSAGE_IDS:
+            self._web_message_ids.popitem(last=False)
 
     async def _is_root_session(self, session_id: str) -> bool:
         known = self._session_is_root.get(session_id)
@@ -809,6 +835,7 @@ class OpenCodeNativeForwarder:
             merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
+            self._remember_web_prompt_message()
             clear_web_prompt_pending(self._bridge_dir)
         # Prompts held behind the finished reply follow its text, before the edge.
         await self._flush_pending_text()

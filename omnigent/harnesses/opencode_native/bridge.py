@@ -710,15 +710,18 @@ def update_active_message_id(
     )
 
 
-def mark_web_prompt_pending(bridge_dir: Path) -> None:
+def mark_web_prompt_pending(bridge_dir: Path, message_id: str = "") -> None:
     """
     Record that a web prompt was injected but its turn has not ended yet.
 
     :param bridge_dir: Native OpenCode bridge directory.
+    :param message_id: OpenCode id of the injected user message, if known.
     :returns: None.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (bridge_dir / _WEB_PROMPT_PENDING_FILE).touch(mode=0o600)
+    marker = bridge_dir / _WEB_PROMPT_PENDING_FILE
+    marker.touch(mode=0o600)
+    marker.write_text(message_id, encoding="utf-8")
 
 
 def clear_web_prompt_pending(bridge_dir: Path) -> None:
@@ -739,6 +742,20 @@ def web_prompt_pending(bridge_dir: Path) -> bool:
     :returns: ``True`` while the pending marker exists.
     """
     return (bridge_dir / _WEB_PROMPT_PENDING_FILE).is_file()
+
+
+def web_prompt_message_id(bridge_dir: Path) -> str | None:
+    """
+    Return the user message id of the pending web prompt, if recorded.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: The OpenCode message id, e.g. ``"msg_..."``, or ``None``.
+    """
+    try:
+        message_id = (bridge_dir / _WEB_PROMPT_PENDING_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return message_id.strip() or None
 
 
 def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
