@@ -268,8 +268,6 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
         (wake, retry_mode)
         for wake in ("cron", "handback", "handback_before_settle")
         for retry_mode in ("none", "same_process", "restart", "status")
-        # A restart before any poll persists the Stop's pending settle loses it.
-        if (wake, retry_mode) != ("handback_before_settle", "restart")
     ],
 )
 async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
@@ -350,7 +348,7 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         assert turn_one_id is not None
 
         # The turn ends: the Stop edge records the pending settle.
-        dedupe.pending_settled_response_id = turn_one_id
+        await forwarder._record_pending_settle(bridge_dir, dedupe, turn_one_id)
         quiet = after_turn
         if wake != "handback_before_settle":
             quiet = await forwarder._forward_available_items(
@@ -537,6 +535,131 @@ def test_a_late_stop_is_attributed_to_the_turn_that_ended(
     forwarder._track_unstopped_turn(items, set(), dedupe, previous_response_id="resp_t")
 
     assert dedupe.unstopped_response_id == expected
+
+
+@pytest.mark.asyncio
+async def test_a_stop_read_before_a_restart_still_settles_its_turn(tmp_path: Path) -> None:
+    """
+    A restart right after a ``Stop`` is consumed keeps that turn settled.
+
+    The hook cursor is already past the ``Stop``, so its settle must be on disk;
+    otherwise the next turn's ``Stop`` is credited to it and a cron wake after
+    that next turn opens no new turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    dedupe = forwarder._ForwardDedupeState()
+    statuses: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_status":
+            statuses.append(payload["data"])
+        elif payload["type"] == "external_conversation_item":
+            items.append(payload["data"])
+        return httpx.Response(202, json={})
+
+    def append(*records: dict[str, Any]) -> None:
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def turn(name: str) -> None:
+        append(
+            {"type": "user", "uuid": f"{name}-0", "message": {"role": "user", "content": name}},
+            {
+                "type": "assistant",
+                "uuid": f"{name}-1",
+                "message": {"role": "assistant", "content": "ok"},
+            },
+        )
+        for event in ("UserPromptSubmit", "Stop"):
+            record_hook_event(
+                bridge_dir, {"hook_event_name": event, "session_id": "claude-session"}
+            )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+
+        async def poll() -> None:
+            nonlocal state, hook_state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+            hook_state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                state=hook_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id=dedupe.unstopped_response_id or state.current_response_id,
+            )
+
+        turn("first")
+        await poll()
+        first_id = state.current_response_id
+        # Restart before any later transcript poll persists the settle.
+        restored_state = forwarder._read_forward_state(bridge_dir)
+        restored_hooks = forwarder._read_hook_state(bridge_dir)
+        assert restored_state is not None and restored_hooks is not None
+        state, hook_state, dedupe = restored_state, restored_hooks, forwarder._ForwardDedupeState()
+
+        turn("second")
+        await poll()
+        second_id = state.current_response_id
+        await poll()
+        assert dedupe.settled_response_id == second_id
+        items.clear()
+        append(
+            {
+                "type": "assistant",
+                "uuid": "cron-0",
+                "message": {"role": "assistant", "content": "Iteration 2: still green."},
+            }
+        )
+        await poll()
+
+    assert first_id is not None and second_id not in {None, first_id}
+    wake_id = items[0]["response_id"]
+    assert wake_id != second_id
+    edges = [(data["status"], data["response_id"]) for data in statuses]
+    assert [edge for edge in edges if edge[0] == "idle"] == [
+        ("idle", first_id),
+        ("idle", second_id),
+    ]
+    assert edges[-1] == ("running", wake_id)
+    assert items[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+    ]
+    assert {item["response_id"] for item in items} == {wake_id}
 
 
 @pytest.mark.asyncio

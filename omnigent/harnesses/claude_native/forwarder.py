@@ -4613,7 +4613,7 @@ async def _forward_available_status_events(
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
             # wake (see _promote_pending_settle and the bridge parser).
-            dedupe.pending_settled_response_id = response_id
+            await _record_pending_settle(bridge_dir, dedupe, response_id)
         durable = next_durable
         await _write_hook_state_async(bridge_dir, durable)
     durable = HookForwardState(
@@ -4623,6 +4623,28 @@ async def _forward_available_status_events(
     )
     await _write_hook_state_async(bridge_dir, durable)
     return durable
+
+
+async def _record_pending_settle(
+    bridge_dir: Path, dedupe: _ForwardDedupeState, response_id: str
+) -> None:
+    """
+    Record an ended turn's pending settle, on disk before its ``Stop`` is passed.
+
+    The hook cursor won't re-read the ``Stop`` after a restart, and a lost
+    settle leaves the turn looking unstopped when the next one opens.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param response_id: Response id of the turn the ``Stop`` ended.
+    :returns: None.
+    """
+    dedupe.pending_settled_response_id = response_id
+    state = await asyncio.to_thread(_read_forward_state, bridge_dir)
+    if state is not None and state.pending_settled_response_id != response_id:
+        await _write_forward_state_async(
+            bridge_dir, replace(state, pending_settled_response_id=response_id)
+        )
 
 
 async def _reopen_turn_after_late_stop(
