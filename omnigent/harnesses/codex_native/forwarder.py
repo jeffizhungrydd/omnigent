@@ -515,6 +515,8 @@ class _CodexForwarderState:
     posted_terminal_count: int = 0
     # A count post failed, so the next edge must restate the count.
     terminal_count_unconfirmed: bool = False
+    # A resumed thread may carry a count an earlier forwarder left on the server.
+    terminal_count_unknown_after_resume: bool = False
     # Rotated-away chats whose zero-count clear failed, oldest first (ordered set).
     pending_count_clear_session_ids: dict[str, None] = field(default_factory=dict)
     # Cleared once the server rejects ``subagent.status`` as an unknown event type.
@@ -560,10 +562,12 @@ class _CodexForwarderState:
             not self.running_terminals
             and not self.posted_terminal_count
             and not self.terminal_count_unconfirmed
+            and not self.terminal_count_unknown_after_resume
         ):
             return None
         self.posted_terminal_count = len(self.running_terminals)
         self.terminal_count_unconfirmed = False
+        self.terminal_count_unknown_after_resume = False
         return [
             {"id": item_id, "type": "shell", "status": "running", "command": command}
             for item_id, command in self.running_terminals.items()
@@ -576,6 +580,7 @@ class _CodexForwarderState:
         :param response: Codex JSON-RPC response envelope.
         :returns: None.
         """
+        self.terminal_count_unknown_after_resume = True
         result = response.get("result")
         if not isinstance(result, dict):
             return
@@ -4051,6 +4056,8 @@ async def _clear_rotated_terminals(
     """
     await _retry_pending_count_clear(client, forwarder_state)
     forwarder_state.running_terminals.clear()
+    # Only a count this forwarder published needs clearing on the old chat.
+    forwarder_state.terminal_count_unknown_after_resume = False
     if forwarder_state.background_tasks_for_edge() is None:
         return
     # The failure belongs to the old chat, so the new chat's edge has nothing to restate.

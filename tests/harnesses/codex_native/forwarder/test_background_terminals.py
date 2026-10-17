@@ -240,6 +240,43 @@ async def test_failed_zero_count_idle_edge_is_restated_by_the_next_one(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_resumed_forwarder_restates_a_count_left_by_its_predecessor(
+    tmp_path: Path,
+) -> None:
+    """A replacement forwarder cannot see its predecessor's terminal, so it restates zero."""
+    _bridge_state(tmp_path)
+    client = _RecordingClient()
+    background = _command("exec-bg", "/bin/bash -lc 'sleep 30'")
+    await _drive(
+        tmp_path,
+        client,
+        [
+            _turn("turn_1", "inProgress"),
+            _item_event("item/started", background),
+            _turn("turn_1", "completed"),
+        ],
+    )
+
+    resumed = fwd._CodexForwarderState(parent_session_id="conv_x")
+    resumed.note_resume_response({"id": 1, "result": {}})
+    await _drive(
+        tmp_path,
+        client,
+        [
+            _item_event("item/completed", {**background, "status": "completed"}),
+            _turn("turn_2", "inProgress"),
+            _turn("turn_2", "completed"),
+        ],
+        resumed,
+    )
+
+    idle = [s for s in _statuses(client) if s["status"] == "idle"]
+    assert idle[0]["background_task_count"] == 1
+    assert idle[-1]["background_task_count"] == 0
+    assert idle[-1]["response_id"] == "codex_turn_2"
+
+
+@pytest.mark.asyncio
 async def test_turn_without_lingering_terminals_posts_no_count(tmp_path: Path) -> None:
     """Terminals that exit within their turn leave status edges unchanged."""
     _bridge_state(tmp_path)
