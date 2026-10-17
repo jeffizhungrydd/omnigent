@@ -537,6 +537,12 @@ def test_forwarder_posts_codex_web_search_tool_call() -> None:
     assert posted[1]["data"]["item_data"]["output"] == "python latest stable version"
 
 
+_EMBEDDED_RESOURCE = {
+    "type": "resource",
+    "resource": {"uri": "file:///notes.md", "mimeType": "text/markdown", "text": "# Notes"},
+}
+
+
 @pytest.mark.parametrize(
     ("status", "result", "error", "output"),
     [
@@ -547,8 +553,14 @@ def test_forwarder_posts_codex_web_search_tool_call() -> None:
             '{"scheduled_tasks": []}',
         ),
         ("failed", None, {"message": "server disconnected"}, "server disconnected"),
+        (
+            "completed",
+            {"content": [_EMBEDDED_RESOURCE]},
+            None,
+            json.dumps(_EMBEDDED_RESOURCE),
+        ),
     ],
-    ids=["completed", "failed"],
+    ids=["completed", "failed", "embedded-resource"],
 )
 def test_forwarder_posts_codex_mcp_tool_call(
     tmp_path: Path,

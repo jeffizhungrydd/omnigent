@@ -6955,10 +6955,15 @@ def _mcp_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
     result = item.get("result")
     content = result.get("content") if isinstance(result, dict) else None
     if isinstance(content, list):
+        # Like Omnigent's own MCP results: text verbatim, other blocks (images,
+        # embedded resources, links) as JSON so the transcript keeps them.
         texts = [
             part["text"]
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+            else json.dumps(part)
             for part in content
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
         ]
     error = item.get("error")
     error_message = error.get("message") if isinstance(error, dict) else error
