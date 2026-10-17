@@ -556,7 +556,8 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
     task notification wakes ends with its own ``Stop``, so the prompts after it
     are still announced, and a shell launched before an Esc is still counted.
     A hand-back that lands mid-turn opens no turn, so that turn's ``Stop``
-    leaves the session idle.
+    leaves the session idle. A late ``Stop`` that idles the earlier turn
+    re-announces the newer one, retrying a failed post until it lands.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -578,10 +579,15 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
     hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
     dedupe = forwarder._ForwardDedupeState()
     posted: list[dict[str, Any]] = []
+    running_failures = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal running_failures
         payload = json.loads(request.content.decode("utf-8"))
         if payload["type"] == "external_session_status":
+            if running_failures and payload["data"]["status"] == "running":
+                running_failures -= 1
+                return httpx.Response(503, json={})
             posted.append(payload["data"])
         return httpx.Response(202, json={})
 
@@ -740,15 +746,33 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
         for _ in range(3):
             await poll()
 
-    assert [(data["status"], data.get("background_task_count")) for data in posted] == [
-        ("running", None),
-        ("idle", 0),
-        ("running", None),
-        ("idle", 0),
-        ("running", None),
-        ("running", 1),
-        ("idle", None),
-        ("running", None),
-        ("idle", 0),
-    ]
+        assert [(data["status"], data.get("background_task_count")) for data in posted] == [
+            ("running", None),
+            ("idle", 0),
+            ("running", None),
+            ("idle", 0),
+            ("running", None),
+            ("running", 1),
+            ("idle", None),
+            ("running", None),
+            ("idle", 0),
+        ]
+        assert posted[-1]["response_id"] == state.current_response_id
+
+        # The next turn opens before the last one's Stop lands; that Stop idles
+        # the last turn and the failed re-announce of the newer one is retried.
+        posted.clear()
+        turn("ninth", hooks=False)
+        turn("tenth", hooks=False)
+        await poll()
+        record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
+        running_failures = 1
+        for _ in range(3):
+            await poll()
+        record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
+        await poll()
+
+    assert [data["status"] for data in posted] == ["running", "running", "idle", "running", "idle"]
+    assert running_failures == 0
+    assert posted[3]["response_id"] == posted[1]["response_id"]
     assert posted[-1]["response_id"] == state.current_response_id

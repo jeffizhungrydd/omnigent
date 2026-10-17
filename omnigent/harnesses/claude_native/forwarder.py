@@ -923,6 +923,8 @@ class _ForwardDedupeState:
     # The hook can land a poll after the new turn's first item, and that Stop
     # belongs to this turn, not the one now current.
     unstopped_response_id: str | None = None
+    # Turn a late ``Stop`` left idle whose ``running`` re-announce awaits a retry.
+    pending_reopen_response_id: str | None = None
     # Turns ended without a ``Stop`` (Esc, a hook-blocked prompt); bounded.
     ended_without_stop: tuple[str, ...] = ()
     # Opening items of the newest transcript turn and of the newest one whose
@@ -4148,6 +4150,9 @@ async def _forward_available_status_events(
     """
     if compaction_retry_tracker is None:
         compaction_retry_tracker = retry_tracker
+    await _reopen_turn_after_late_stop(
+        client, session_id=session_id, dedupe=dedupe, retry_tracker=retry_tracker
+    )
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     # Read all session ids ever pinned to this bridge so a rotation race
     # (batch spans the old id's StopFailure and the new SessionStart)
@@ -4598,12 +4603,12 @@ async def _forward_available_status_events(
                 dedupe.stop_ahead_of_transcript = True
         dedupe.woken_running_response_id = None
         dedupe.unstopped_response_id = None
+        dedupe.pending_reopen_response_id = None
         if status == "idle" and reopen is not None and reopen != response_id:
-            with contextlib.suppress(httpx.HTTPError):
-                await post_external_session_status(
-                    client, session_id=session_id, status="running", response_id=reopen
-                )
-                dedupe.woken_running_response_id = reopen
+            dedupe.pending_reopen_response_id = reopen
+            await _reopen_turn_after_late_stop(
+                client, session_id=session_id, dedupe=dedupe, retry_tracker=retry_tracker
+            )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
@@ -4618,6 +4623,39 @@ async def _forward_available_status_events(
     )
     await _write_hook_state_async(bridge_dir, durable)
     return durable
+
+
+async def _reopen_turn_after_late_stop(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """
+    Re-announce as running the turn a late ``Stop`` for an earlier turn idled.
+
+    Its opening item is already consumed, so this edge is kept and retried
+    until it posts, the turn ends, or a newer turn opens.
+
+    :param client: Omnigent API client.
+    :param session_id: Session being forwarded.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param retry_tracker: Retry/backoff state for hook status posts.
+    """
+    reopen = dedupe.pending_reopen_response_id
+    if reopen is None:
+        return
+    if await _post_transcript_status(
+        client,
+        session_id=session_id,
+        retry_tracker=retry_tracker,
+        retry_key=f"late-stop-reopen:{reopen}",
+        status="running",
+        response_id=reopen,
+    ):
+        dedupe.pending_reopen_response_id = None
+        dedupe.woken_running_response_id = reopen
 
 
 async def _ensure_state_for_transcript(
@@ -4877,6 +4915,9 @@ async def _announce_transcript_edges(
         if item.source_id in seen:
             continue
         text = _user_text(item)
+        if text is not None and text.startswith(_INTERRUPT_MARKER_PREFIX):
+            # Esc ended the turn awaiting a re-announce; it shows idle already.
+            dedupe.pending_reopen_response_id = None
         task_id = item.background_task_id
         count = None
         tasks = None
@@ -4924,6 +4965,7 @@ async def _announce_transcript_edges(
             dedupe.background_tasks = tuple(tasks or ())
         else:
             dedupe.woken_running_response_id = response_id if status == "running" else None
+            dedupe.pending_reopen_response_id = None
     return True
 
 
