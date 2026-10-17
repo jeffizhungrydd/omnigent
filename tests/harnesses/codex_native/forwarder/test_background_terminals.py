@@ -234,7 +234,7 @@ async def test_failed_zero_count_idle_edge_is_restated_by_the_next_one(tmp_path:
     )
 
     idle = [s for s in _statuses(client) if s["status"] == "idle"]
-    assert [s.get("background_task_count") for s in idle][0] == 1
+    assert idle[0]["background_task_count"] == 1
     assert idle[-1]["background_task_count"] == 0
     assert idle[-1]["response_id"] == "codex_turn_3"
 
