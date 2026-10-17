@@ -22,6 +22,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    _BACKGROUND_TASK_FORWARD_LIMIT,
     _INTERRUPT_MARKER_PREFIX,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
@@ -32,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     HookReadResult,
     TranscriptReadResult,
     _display_text,
+    _normalize_background_task,
     _transcript_items_from_entry,
     compute_transcript_cumulative_cost,
     read_active_session_id,
@@ -933,6 +935,12 @@ class _ForwardDedupeState:
     # An interrupted turn fires no ``Stop``, so launches carry the tally.
     stop_background_task_count: int = 0
     background_task_ids_since_stop: frozenset[str] = frozenset()
+    # Shell detail matching that tally: a launch republishes it, since the
+    # server replaces its cached detail with each positive count.
+    background_tasks: tuple[dict[str, object], ...] = ()
+    # ``(call_id, input)`` of recent ``run_in_background`` Bash calls, so a
+    # launch can name its shell; bounded.
+    background_bash_calls: tuple[tuple[str, dict[str, object]], ...] = ()
     # Failed cost posts are retried by this long-running poll loop. Without a
     # retry gate, an edge 429 turns the poll interval into a request storm and
     # prevents the limiter from recovering.
@@ -4568,6 +4576,7 @@ async def _forward_available_status_events(
         if status == "idle" and record.background_task_count is not None:
             dedupe.stop_background_task_count = record.background_task_count
             dedupe.background_task_ids_since_stop = frozenset()
+            dedupe.background_tasks = tuple(record.background_tasks or ())
         # A late Stop re-attributed to an earlier turn must not leave the turn
         # already announced as running looking idle.
         reattributed = (
@@ -4864,11 +4873,13 @@ async def _announce_transcript_edges(
     """
     finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
     for item in items:
+        _remember_background_bash_call(item, dedupe)
         if item.source_id in seen:
             continue
         text = _user_text(item)
         task_id = item.background_task_id
         count = None
+        tasks = None
         if (
             text is not None
             and text.startswith(_INTERRUPT_MARKER_PREFIX)
@@ -4894,6 +4905,7 @@ async def _announce_transcript_edges(
             count = (
                 dedupe.stop_background_task_count + len(dedupe.background_task_ids_since_stop) + 1
             )
+            tasks = [*dedupe.background_tasks, _launched_background_task(item, task_id, dedupe)]
         else:
             continue
         if not await _post_transcript_status(
@@ -4904,13 +4916,57 @@ async def _announce_transcript_edges(
             status=status,
             response_id=response_id,
             background_task_count=count,
+            background_tasks=tasks[-_BACKGROUND_TASK_FORWARD_LIMIT:] if tasks else None,
         ):
             return False
         if task_id is not None and count is not None:
             dedupe.background_task_ids_since_stop |= {task_id}
+            dedupe.background_tasks = tuple(tasks or ())
         else:
             dedupe.woken_running_response_id = response_id if status == "running" else None
     return True
+
+
+_BACKGROUND_BASH_CALL_LIMIT = 16
+
+
+def _remember_background_bash_call(
+    item: ClaudeTranscriptItem, dedupe: _ForwardDedupeState
+) -> None:
+    """Record a ``run_in_background`` Bash call's input for its later launch result."""
+    if item.item_type != "function_call" or item.data.get("name") != "Bash":
+        return
+    call_id = item.data.get("call_id")
+    raw_arguments = item.data.get("arguments")
+    if not isinstance(call_id, str) or not isinstance(raw_arguments, str):
+        return
+    try:
+        arguments = json.loads(raw_arguments)
+    except ValueError:
+        return
+    if not isinstance(arguments, dict):
+        return
+    if arguments.get("run_in_background") is not True:
+        return
+    calls = [entry for entry in dedupe.background_bash_calls if entry[0] != call_id]
+    calls.append((call_id, arguments))
+    dedupe.background_bash_calls = tuple(calls[-_BACKGROUND_BASH_CALL_LIMIT:])
+
+
+def _launched_background_task(
+    item: ClaudeTranscriptItem, task_id: str, dedupe: _ForwardDedupeState
+) -> dict[str, object]:
+    """Build the ``Stop``-style detail entry for a shell a Bash result launched."""
+    call_id = item.data.get("call_id")
+    arguments = next((args for cid, args in dedupe.background_bash_calls if cid == call_id), {})
+    raw = {
+        "id": task_id,
+        "type": "shell",
+        "status": "running",
+        "description": arguments.get("description"),
+        "command": arguments.get("command"),
+    }
+    return _normalize_background_task(raw) or {"id": task_id}
 
 
 async def _post_transcript_status(
@@ -4922,6 +4978,7 @@ async def _post_transcript_status(
     status: str,
     response_id: str,
     background_task_count: int | None = None,
+    background_tasks: list[dict[str, object]] | None = None,
 ) -> bool:
     """
     Post a transcript-derived status edge, holding its items for a retry on failure.
@@ -4933,6 +4990,7 @@ async def _post_transcript_status(
     :param status: Status to post, e.g. ``"running"``.
     :param response_id: Turn the edge belongs to.
     :param background_task_count: Background-shell tally, when it changed.
+    :param background_tasks: Detail for every shell in that tally.
     :returns: ``False`` when the edge must be retried before its items forward.
     """
     if retry_tracker.retry_delay_s(retry_key) is not None:
@@ -4944,6 +5002,7 @@ async def _post_transcript_status(
             status=status,
             response_id=response_id,
             background_task_count=background_task_count,
+            background_tasks=background_tasks,
         )
     except httpx.HTTPError as exc:
         decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)

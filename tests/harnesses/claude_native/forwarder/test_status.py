@@ -439,9 +439,16 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
     """
     A shell launched in a turn later cut off by Esc (no ``Stop``) is still counted.
 
+    The launch republishes the shells the previous ``Stop`` named plus the new
+    one, since the server replaces its cached detail with each positive count.
     A failed count post holds the batch, so the next poll retries it once.
     """
+    bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
+    earlier = [
+        {"type": "user", "uuid": "earlier", "message": {"role": "user", "content": "first"}},
+        {"type": "assistant", "uuid": "reply", "message": {"role": "assistant", "content": "ok"}},
+    ]
     records = [
         {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "go"}},
         {
@@ -454,7 +461,11 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
                         "type": "tool_use",
                         "id": "toolu_bg",
                         "name": "Bash",
-                        "input": {"command": "sleep 40", "run_in_background": True},
+                        "input": {
+                            "command": "sleep 40",
+                            "description": "Wait a bit",
+                            "run_in_background": True,
+                        },
                     }
                 ],
             },
@@ -486,8 +497,14 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
         },
     ]
     transcript_path.write_text(
-        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        "".join(json.dumps(record) + "\n" for record in earlier), encoding="utf-8"
     )
+    earlier_shell = {"id": "a1", "type": "shell", "status": "running", "command": "make watch"}
+    for event in (
+        {"hook_event_name": "SessionStart", "transcript_path": str(transcript_path)},
+        {"hook_event_name": "Stop", "background_tasks": [earlier_shell]},
+    ):
+        record_hook_event(bridge_dir, {**event, "session_id": "claude-session"})
     state = forwarder.TranscriptForwardState(
         transcript_path=transcript_path,
         line_cursor=0,
@@ -496,39 +513,78 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
     )
     statuses: list[dict[str, Any]] = []
     item_ids: list[str] = []
+    fail_next_status = False
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal status_failure
+        nonlocal fail_next_status
         payload = json.loads(request.content.decode("utf-8"))
         if payload["type"] == "external_session_status":
-            if status_failure:
-                status_failure = False
+            if fail_next_status and "background_task_count" in payload["data"]:
+                fail_next_status = False
                 return httpx.Response(503)
             statuses.append(payload["data"])
         else:
             item_ids.append(payload["data"]["source_id"])
         return httpx.Response(202, json={})
 
-    dedupe = forwarder._ForwardDedupeState(stop_background_task_count=1)
+    dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://test"
     ) as client:
-        for _ in range(2):
+
+        async def forward_items() -> None:
+            nonlocal state
             state = await forwarder._forward_available_items(
                 client=client,
                 session_id="conv_abc",
-                bridge_dir=tmp_path / "bridge",
+                bridge_dir=bridge_dir,
                 agent_name="claude-native-ui",
                 state=state,
                 retry_tracker=forwarder._PostRetryTracker(),
                 dedupe=dedupe,
             )
 
-    [status] = statuses
-    assert status["status"] == "running"
-    # The shell left running by the previous turn plus the one just launched.
-    assert status["background_task_count"] == 2
-    assert len(item_ids) == len(set(item_ids)) == 4
+        await forward_items()
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id=state.current_response_id,
+        )
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(json.dumps(record) + "\n" for record in records)
+        fail_next_status = status_failure
+        for _ in range(2):
+            await forward_items()
+
+    assert [(data["status"], data.get("background_task_count")) for data in statuses] == [
+        ("idle", 1),
+        ("running", None),
+        # The shell left running by the previous turn plus the one just launched.
+        ("running", 2),
+        ("idle", None),
+    ]
+    # Every count names its shells, so a reload cannot show an empty popover.
+    for data in statuses:
+        if data.get("background_task_count"):
+            assert len(data["background_tasks"]) == data["background_task_count"]
+    assert statuses[2]["background_tasks"] == [
+        earlier_shell,
+        {
+            "id": "bhr10wb5b",
+            "type": "shell",
+            "status": "running",
+            "description": "Wait a bit",
+            "command": "sleep 40",
+        },
+    ]
+    assert len(item_ids) == len(set(item_ids)) == 6
 
 
 async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
