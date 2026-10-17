@@ -786,6 +786,8 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
+            # An earlier reply whose completion was missed precedes queued prompts.
+            await self._flush_pending_text(before=message_id)
             # Prompts queued before this message was created precede it.
             await self._release_held_user_parts(before=message_id)
             # This turn's per-turn ``response_id`` — the running/idle edges carry
@@ -905,9 +907,11 @@ class OpenCodeNativeForwarder:
             text, message_id=message_id if isinstance(message_id, str) else None
         )
 
-    async def _flush_pending_text(self) -> None:
-        """Finalize accumulated assistant text parts as durable chat items."""
+    async def _flush_pending_text(self, *, before: str | None = None) -> None:
+        """Finalize accumulated assistant text parts (only ids below *before* if given)."""
         for part_id, (message_id, text) in list(self._pending_text.items()):
+            if before is not None and str(message_id) >= before:
+                continue
             self._pending_text.pop(part_id, None)
             if not text:
                 continue

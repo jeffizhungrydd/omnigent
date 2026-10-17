@@ -234,6 +234,26 @@ async def test_prompt_queued_mid_reply_lands_after_that_reply() -> None:
     ]
 
 
+async def test_prompt_queued_mid_reply_follows_it_when_its_completion_is_missed() -> None:
+    """A newer reply starting without the earlier one's step-finish keeps native order."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_02", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_02", "msg_02", "first reply"))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_03", "role": "user"}))
+    await fwd.handle_event(_text_part("prt_03", "msg_03", "queued prompt"))
+    # The step-finish for msg_02 fell in a reconnect gap.
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_04", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_04", "msg_04", "second reply"))
+    await fwd.handle_event(_event("session.idle"))
+
+    assert _message_texts(server) == [
+        ("assistant", "first reply"),
+        ("user", "queued prompt"),
+        ("assistant", "second reply"),
+    ]
+
+
 async def test_prompt_queued_mid_reply_is_posted_when_the_turn_aborts() -> None:
     """An interrupted reply (no step-finish) still releases the queued prompt."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
