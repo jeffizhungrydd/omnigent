@@ -466,9 +466,17 @@ async def test_prompt_in_a_session_picked_from_the_tui_list_switches_to_it() -> 
 
 
 async def test_switch_to_a_finished_session_does_not_post_a_stale_idle_edge() -> None:
-    """Catching up a picked session's old history is not a missed turn end."""
+    """Catching up a picked session's old history is neither a turn start nor end."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     opencode.sessions["ses_old"] = OpenCodeSession(id="ses_old")
+    tool_part = {
+        "id": "prt_o1",
+        "messageID": "msg_o1",
+        "type": "tool",
+        "callID": "call_o1",
+        "tool": "bash",
+        "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+    }
     opencode.messages = [
         {"info": {"id": "msg_o0", "role": "user"}, "parts": []},
         {
@@ -478,13 +486,16 @@ async def test_switch_to_a_finished_session_does_not_post_a_stale_idle_edge() ->
                 "finish": "stop",
                 "time": {"completed": 1},
             },
-            "parts": [],
+            "parts": [tool_part],
         },
     ]
     fwd = _forwarder(server, opencode)
     for event in _user_turn("ses_old", "msg_o2", "back in the old one"):
         await fwd.handle_event(event)
 
+    assert ("function_call", "call_o1") in _idempotent_transcript(server)
+    assert not fwd.state.turn_active
+    await fwd.fail_turn_after_server_exit(1)
     assert _status_edges(server.posts) == []
     assert fwd._active_message_id is None
 

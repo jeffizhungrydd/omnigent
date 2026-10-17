@@ -270,6 +270,8 @@ class OpenCodeNativeForwarder:
         # User message ids of web prompts, so their echoes never count as a TUI switch.
         self._web_message_ids: OrderedDict[str, None] = OrderedDict()
         self._question_tasks: dict[str, asyncio.Task[None]] = {}
+        # Set while replaying a switched-to session's history, which is not live.
+        self._replaying_switched_history = False
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -330,7 +332,8 @@ class OpenCodeNativeForwarder:
         live snapshots that arrive after reconnect.
 
         :param finish_missed_turn: End a turn whose idle edge fell in the gap.
-            Off after a TUI session switch, where unseen history is not a gap.
+            Off after a TUI session switch, where unseen history is not a gap,
+            so replaying it neither starts nor ends a live turn.
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
@@ -338,6 +341,22 @@ class OpenCodeNativeForwarder:
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
             return
         known_message_ids = set(self._msg_role)
+        self._replaying_switched_history = not finish_missed_turn
+        try:
+            await self._replay_history(messages)
+        finally:
+            self._replaying_switched_history = False
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
+            )
+        if finish_missed_turn:
+            await self._end_turn_missed_during_gap(messages, known_message_ids)
+
+    async def _replay_history(self, messages: list[_JsonObject]) -> None:
+        """Feed unseen persisted parts through the live posting paths."""
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
@@ -370,14 +389,6 @@ class OpenCodeNativeForwarder:
                     await self._handle_file_part(part)
             if role == "assistant" and _message_is_complete(info_map):
                 await self._flush_pending_text()
-        try:
-            await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
-            _logger.debug(
-                "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
-            )
-        if finish_missed_turn:
-            await self._end_turn_missed_during_gap(messages, known_message_ids)
 
     async def _end_turn_missed_during_gap(
         self, messages: list[_JsonObject], known_message_ids: set[str]
@@ -804,6 +815,8 @@ class OpenCodeNativeForwarder:
         assistant ``message.updated`` supplies the id, and emitting an id-less
         (session-id-fallback) edge then would never match the tool-call items.
         """
+        if self._replaying_switched_history:
+            return
         self.state.turn_active = True
         if self._running_response_id is None and self._active_message_id is not None:
             self._running_response_id = self._active_message_id
