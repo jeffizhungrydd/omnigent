@@ -99,6 +99,8 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
+# Rotated-away chats whose failed background-count clear is still retried.
+_MAX_PENDING_COUNT_CLEARS = 8
 _SOURCE_ID_MAX_CHARS = 256
 # Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
 # or a slow/hung server cannot stall forwarder startup: each re-POST is a single
@@ -513,8 +515,8 @@ class _CodexForwarderState:
     posted_terminal_count: int = 0
     # A count post failed, so the next edge must restate the count.
     terminal_count_unconfirmed: bool = False
-    # Rotated-away chat whose zero-count clear failed and still needs a retry.
-    pending_count_clear_session_id: str | None = None
+    # Rotated-away chats whose zero-count clear failed, oldest first (ordered set).
+    pending_count_clear_session_ids: dict[str, None] = field(default_factory=dict)
 
     def note_terminal_started(self, item: _JsonObject) -> None:
         """
@@ -4051,7 +4053,10 @@ async def _clear_rotated_terminals(
         return
     # The failure belongs to the old chat, so the new chat's edge has nothing to restate.
     if not await _send_background_task_count(client, old_session_id, []):
-        forwarder_state.pending_count_clear_session_id = old_session_id
+        pending = forwarder_state.pending_count_clear_session_ids
+        pending[old_session_id] = None
+        while len(pending) > _MAX_PENDING_COUNT_CLEARS:
+            del pending[next(iter(pending))]
 
 
 async def _retry_pending_count_clear(
@@ -4059,15 +4064,18 @@ async def _retry_pending_count_clear(
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
-    Retry a rotated-away chat's failed background-count clear.
+    Retry the failed background-count clears of rotated-away chats.
+
+    Each chat stays pending until its own clear is accepted.
 
     :param client: HTTP client for Omnigent event posts.
-    :param forwarder_state: Forwarder state holding the pending clear.
+    :param forwarder_state: Forwarder state holding the pending clears.
     :returns: None.
     """
-    session_id = forwarder_state.pending_count_clear_session_id
-    if session_id is not None and await _send_background_task_count(client, session_id, []):
-        forwarder_state.pending_count_clear_session_id = None
+    pending = forwarder_state.pending_count_clear_session_ids
+    for session_id in list(pending):
+        if await _send_background_task_count(client, session_id, []):
+            pending.pop(session_id, None)
 
 
 async def _maybe_post_terminal_finished(

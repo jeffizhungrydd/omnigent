@@ -286,6 +286,31 @@ async def test_failed_rotation_clear_is_retried_against_the_old_chat(tmp_path: P
     assert _statuses(client)[-1] == {"status": "idle", "response_id": "codex_turn_123"}
 
 
+@pytest.mark.asyncio
+async def test_consecutive_failed_rotation_clears_are_all_retried(tmp_path: Path) -> None:
+    """A second failed ``/new`` clear does not drop the first chat's pending clear."""
+    _bridge_state(tmp_path)
+    client = _CountPostFailingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_a")
+    for old_chat, new_chat in (("conv_a", "conv_b"), ("conv_b", "conv_x")):
+        state.note_terminal_started(_command(f"exec-{old_chat}", "sleep 30"))
+        assert state.background_tasks_for_edge() is not None
+        await fwd._clear_rotated_terminals(client, old_chat, state)  # type: ignore[arg-type]
+        state.note_parent_rotation(new_chat)
+
+    client.failing = False
+    client.posts.clear()
+    await _drive(tmp_path, client, [_TURN_STARTED, _TURN_COMPLETED], state)
+
+    count_posts = [
+        (url, body["data"]) for url, body in client.posts if body["type"] == "subagent.status"
+    ]
+    assert count_posts == [
+        ("/v1/sessions/conv_a/events", {"idle": True, "background_task_count": 0}),
+        ("/v1/sessions/conv_b/events", {"idle": True, "background_task_count": 0}),
+    ]
+
+
 def test_running_terminal_command_is_bounded_for_display() -> None:
     """A huge heredoc command is clamped in the detail but still counted."""
     state = fwd._CodexForwarderState(parent_session_id="conv_x")
