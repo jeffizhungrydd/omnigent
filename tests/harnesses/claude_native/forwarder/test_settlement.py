@@ -15,6 +15,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     prepare_bridge_dir,
+    record_hook_event,
 )
 
 
@@ -520,3 +521,99 @@ def test_a_late_stop_is_attributed_to_the_turn_that_ended(
     forwarder._track_unstopped_turn(items, set(), dedupe, previous_response_id="resp_t")
 
     assert dedupe.unstopped_response_id == expected
+
+
+@pytest.mark.asyncio
+async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(tmp_path: Path) -> None:
+    """
+    A ``Stop`` read before its turn's transcript lines still settles that turn.
+
+    Claude flushes the transcript after running hooks, so a quick turn's
+    ``Stop`` can be read first and stamped with no turn. The next prompt must
+    not mistake that turn for one still awaiting its ``Stop``, or the last
+    turn's ``Stop`` is credited to it and the last turn is re-opened as running.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    dedupe = forwarder._ForwardDedupeState()
+    statuses: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_status":
+            statuses.append(payload["data"]["status"])
+        return httpx.Response(202, json={})
+
+    def turn(name: str, *, transcript: bool = True, hooks: bool = True) -> None:
+        if transcript:
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                for role, content in (
+                    ("user", name),
+                    ("assistant", [{"type": "text", "text": "ok"}]),
+                ):
+                    record = {"type": role, "uuid": f"{name}-{role}"}
+                    handle.write(
+                        json.dumps({**record, "message": {"role": role, "content": content}})
+                        + "\n"
+                    )
+        if hooks:
+            for event in ("UserPromptSubmit", "Stop"):
+                record_hook_event(
+                    bridge_dir, {"hook_event_name": event, "session_id": "claude-session"}
+                )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+
+        async def poll() -> None:
+            # One forwarder loop iteration: transcript items, then hook edges.
+            nonlocal state, hook_state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+            hook_state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                state=hook_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id=dedupe.unstopped_response_id or state.current_response_id,
+            )
+
+        turn("first", transcript=False)
+        await poll()
+        turn("first", hooks=False)
+        await poll()
+        for name in ("second", "third"):
+            turn(name)
+            await poll()
+            await poll()
+
+    assert statuses == ["idle", "idle", "running", "idle"]

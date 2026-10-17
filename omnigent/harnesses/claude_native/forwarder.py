@@ -922,6 +922,12 @@ class _ForwardDedupeState:
     unstopped_response_id: str | None = None
     # Turns ended without a ``Stop`` (Esc, a hook-blocked prompt); bounded.
     ended_without_stop: tuple[str, ...] = ()
+    # Opening items of the newest transcript turn and of the newest one whose
+    # ``Stop`` was read. A quick turn's ``Stop`` can be read before its
+    # transcript lines; it then belongs to the next turn to open.
+    newest_turn_source_id: str | None = None
+    stopped_turn_source_id: str | None = None
+    stop_ahead_of_transcript: bool = False
     # Background shells: the last ``Stop`` count, plus shells launched since.
     # An interrupted turn fires no ``Stop``, so launches carry the tally.
     stop_background_task_count: int = 0
@@ -4568,6 +4574,13 @@ async def _forward_available_status_events(
             and dedupe.unstopped_response_id == response_id
         )
         reopen = dedupe.woken_running_response_id if reattributed else None
+        if not reattributed:
+            newest = dedupe.newest_turn_source_id
+            if newest is not None and newest != dedupe.stopped_turn_source_id:
+                dedupe.stopped_turn_source_id = newest
+            elif newest is not None or response_id is None:
+                # No transcript turn awaits this Stop: its lines are not read yet.
+                dedupe.stop_ahead_of_transcript = True
         dedupe.woken_running_response_id = None
         dedupe.unstopped_response_id = None
         if status == "idle" and reopen is not None and reopen != response_id:
@@ -4792,15 +4805,26 @@ def _track_unstopped_turn(
         if text is not None and text.startswith(_INTERRUPT_MARKER_PREFIX):
             # Esc ends the turn without a Stop; the marker has its own id.
             ended += [rid for rid in (active, item.response_id) if rid and rid not in ended]
+            dedupe.stopped_turn_source_id = dedupe.newest_turn_source_id
         if (
             item.response_id != active
             and _opens_turn(item)
-            and active is not None
-            and active not in ended
-            and active not in {dedupe.settled_response_id, dedupe.pending_settled_response_id}
-            and dedupe.unstopped_response_id is None
+            and item.source_id != dedupe.newest_turn_source_id
         ):
-            dedupe.unstopped_response_id = active
+            newest = dedupe.newest_turn_source_id
+            if (
+                active is not None
+                and (newest is None or newest != dedupe.stopped_turn_source_id)
+                and active not in ended
+                and active not in {dedupe.settled_response_id, dedupe.pending_settled_response_id}
+                and dedupe.unstopped_response_id is None
+            ):
+                dedupe.unstopped_response_id = active
+            dedupe.newest_turn_source_id = item.source_id
+            if dedupe.stop_ahead_of_transcript:
+                # A Stop read before this turn's lines has already ended it.
+                dedupe.stopped_turn_source_id = item.source_id
+                dedupe.stop_ahead_of_transcript = False
         active = item.response_id
     dedupe.ended_without_stop = tuple(ended[-16:])
 
