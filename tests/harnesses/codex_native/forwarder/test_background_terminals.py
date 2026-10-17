@@ -177,6 +177,68 @@ async def test_failed_count_clear_is_restated_by_the_next_idle_edge(tmp_path: Pa
     assert statuses[3]["background_task_count"] == 0
 
 
+class _ZeroCountEdgeFailingClient(_RecordingClient):
+    """Fails idle edges that clear the count while ``failing`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = True
+
+    async def post(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
+        response = await super().post(url, json=json, timeout=timeout)
+        data = json["data"]
+        if (
+            self.failing
+            and json["type"] == "external_session_status"
+            and data.get("background_task_count") == 0
+        ):
+            return httpx.Response(500, request=response.request)
+        return response
+
+
+def _turn(turn_id: str, status: str) -> dict:
+    method = "turn/started" if status == "inProgress" else "turn/completed"
+    return {
+        "method": method,
+        "params": {
+            "threadId": "thread_123",
+            "turn": {"id": turn_id, "status": status, "items": []},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_zero_count_idle_edge_is_restated_by_the_next_one(tmp_path: Path) -> None:
+    """An idle edge that lost its clear must not leave later edges silent about the count."""
+    _bridge_state(tmp_path)
+    client = _ZeroCountEdgeFailingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    background = _command("exec-bg", "/bin/bash -lc 'sleep 30'")
+
+    await _drive(
+        tmp_path,
+        client,
+        [
+            _turn("turn_1", "inProgress"),
+            _item_event("item/started", background),
+            _turn("turn_1", "completed"),
+            _turn("turn_2", "inProgress"),
+            _item_event("item/completed", {**background, "status": "completed"}),
+            _turn("turn_2", "completed"),
+        ],
+        state,
+    )
+    client.failing = False
+    await _drive(
+        tmp_path, client, [_turn("turn_3", "inProgress"), _turn("turn_3", "completed")], state
+    )
+
+    idle = [s for s in _statuses(client) if s["status"] == "idle"]
+    assert [s.get("background_task_count") for s in idle][0] == 1
+    assert idle[-1]["background_task_count"] == 0
+    assert idle[-1]["response_id"] == "codex_turn_3"
+
+
 @pytest.mark.asyncio
 async def test_turn_without_lingering_terminals_posts_no_count(tmp_path: Path) -> None:
     """Terminals that exit within their turn leave status edges unchanged."""

@@ -4299,18 +4299,16 @@ async def _handle_terminal_turn_boundary_inner(
     )
     handled = terminal.handled
     if terminal.edge is not None:
+        background_tasks = None
         if forwarder_state is not None and terminal.edge.status == "idle":
             await _retry_pending_count_clear(client, forwarder_state)
-        await _post_turn_status_edge(
-            client,
-            session_id,
-            terminal.edge,
-            background_tasks=(
-                forwarder_state.background_tasks_for_edge()
-                if forwarder_state is not None and terminal.edge.status == "idle"
-                else None
-            ),
+            background_tasks = forwarder_state.background_tasks_for_edge()
+        delivered = await _post_turn_status_edge(
+            client, session_id, terminal.edge, background_tasks=background_tasks
         )
+        if not delivered and background_tasks is not None and forwarder_state is not None:
+            # The server kept its old tally, so the next edge must restate the count.
+            forwarder_state.terminal_count_unconfirmed = True
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -7186,7 +7184,7 @@ async def _post_status(
     compaction_model: str | None = None,
     selected_model: str | None = None,
     background_tasks: list[dict[str, object]] | None = None,
-) -> None:
+) -> bool:
     """
     Publish a native Codex status edge.
 
@@ -7206,7 +7204,7 @@ async def _post_status(
     :param selected_model: The thread's selected model for that failure.
     :param background_tasks: Terminals still running at this edge. When set,
         the edge carries their count (``0`` clears Omnigent's tally) and detail.
-    :returns: None.
+    :returns: ``True`` when the server accepted the edge.
     """
     data: _JsonObject = {"status": status}
     if background_tasks is not None:
@@ -7229,6 +7227,7 @@ async def _post_status(
         data=data,
     )
     _log_failed_session_event_post("external_session_status", response)
+    return response is not None and response.status_code < 400
 
 
 async def _post_turn_status_edge(
@@ -7237,7 +7236,7 @@ async def _post_turn_status_edge(
     edge: _CodexTurnStatusEdge | None,
     *,
     background_tasks: list[dict[str, object]] | None = None,
-) -> None:
+) -> bool:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
 
@@ -7251,10 +7250,10 @@ async def _post_turn_status_edge(
     :param edge: Derived lifecycle edge, or ``None`` when no status should
         be published.
     :param background_tasks: Terminals still running, sent on ``idle`` edges.
-    :returns: None.
+    :returns: ``True`` when an edge was published and accepted.
     """
     if edge is None:
-        return
+        return False
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -7269,7 +7268,7 @@ async def _post_turn_status_edge(
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
-    await _post_status(
+    return await _post_status(
         client,
         session_id,
         edge.status,
