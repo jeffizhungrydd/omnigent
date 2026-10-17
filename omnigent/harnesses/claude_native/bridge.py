@@ -55,7 +55,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -844,6 +844,9 @@ class ClaudeTranscriptItem:
         kept outside model-visible conversation content.
     :param background_task_id: Claude's id for a background shell this
         tool result launched, e.g. ``"bhr10wb5b"``.
+    :param opens_turn: This item starts a new Claude turn: a prompt, a task
+        notification that wakes Claude, a hand-back after the turn ended or a
+        scheduled wake. A hand-back that lands mid-turn does not.
     """
 
     source_id: str
@@ -856,6 +859,7 @@ class ClaudeTranscriptItem:
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
     background_task_id: str | None = None
+    opens_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -8204,6 +8208,7 @@ def _attachment_transcript_items_from_entry(
         agent_message_candidate=_is_agent_notification_text(
             _unwrap_pasted_content_markers(prompt)
         ),
+        opens_turn=True,
     )
     return None, [item]
 
@@ -8355,6 +8360,9 @@ def _compact_noop_stdout(content: str) -> str | None:
 # name>`` is handled separately by the slash-command parser;
 # ``<bash-*>`` records are handled separately as ``terminal_command``
 # items; the rest must always drop.
+# Claude's record of an Esc: it ends the active turn and fires no ``Stop``.
+_INTERRUPT_MARKER_PREFIX = "[Request interrupted by user"
+
 _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
     "<command-message>",
     "<command-args>",
@@ -8919,6 +8927,8 @@ def _user_transcript_items_from_entry(
                     },
                     response_id=fallback_response_id,
                     subagent_return_id=return_id,
+                    opens_turn=handback_wakes
+                    or content.lstrip().startswith("<task-notification>"),
                 )
             )
             if handback_wakes:
@@ -8982,6 +8992,7 @@ def _user_transcript_items_from_entry(
                 agent_message_candidate=_is_agent_notification_text(
                     _unwrap_pasted_content_markers(content)
                 ),
+                opens_turn=not stripped.startswith(_INTERRUPT_MARKER_PREFIX),
             )
         )
         return None, items
@@ -9072,6 +9083,16 @@ def _user_transcript_items_from_entry(
                 ),
             ),
         )
+    interrupted = (
+        " ".join(str(block["text"]) for block in user_blocks)
+        .strip()
+        .startswith(_INTERRUPT_MARKER_PREFIX)
+    )
+    if (saw_user_text or handback_wakes) and not interrupted:
+        # The prompt, or else the first notification, opens the new turn.
+        opener = next((i for i, item in enumerate(items) if item.item_type == "message"), None)
+        if opener is not None:
+            items[opener] = replace(items[opener], opens_turn=True)
     if handback_wakes and items and not user_blocks:
         return fallback_response_id, items
     return (None if saw_user_text else current_response_id), items
@@ -9237,6 +9258,7 @@ def _scheduled_wake_marker_item(source_key: str, response_id: str) -> ClaudeTran
             "content": [{"type": "input_text", "text": _SCHEDULED_WAKE_MARKER_TEXT}],
         },
         response_id=response_id,
+        opens_turn=True,
     )
 
 

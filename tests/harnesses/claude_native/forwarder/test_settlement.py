@@ -261,9 +261,17 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
     )
 
 
-@pytest.mark.parametrize("retry_mode", ["none", "same_process", "restart"])
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wake", ["cron", "handback"])
+@pytest.mark.parametrize(
+    ("wake", "retry_mode"),
+    [
+        (wake, retry_mode)
+        for wake in ("cron", "handback", "handback_before_settle")
+        for retry_mode in ("none", "same_process", "restart", "status")
+        # A restart before any poll persists the Stop's pending settle loses it.
+        if (wake, retry_mode) != ("handback_before_settle", "restart")
+    ],
+)
 async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
     tmp_path: Path, retry_mode: str, wake: str
 ) -> None:
@@ -274,8 +282,10 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
     (covered by the status-events test — recorded directly here). Poll 2
     is quiet and promotes the settle, persisting it. Poll 3 sees a turn
     Claude started on its own — a cron firing (no user entry, so the
-    scheduled-wake marker leads) or a sub-agent hand-back. It must post
-    ``running`` once, then the turn's items, all under a new response id.
+    scheduled-wake marker leads) or a sub-agent hand-back, which can also
+    land before the quiet poll. It must post ``running`` once, then the
+    turn's items, all under a new response id. A failed ``running`` post
+    holds the items until it is retried.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -313,12 +323,13 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
-        if (
-            retry_mode != "none"
-            and not failed_marker
-            and payload["type"] == "external_conversation_item"
+        failing = (
+            payload["type"] == "external_session_status"
+            if retry_mode == "status"
+            else payload["type"] == "external_conversation_item"
             and payload["data"]["item_data"].get("role") == "user"
-        ):
+        )
+        if retry_mode != "none" and not failed_marker and failing:
             failed_marker = True
             return httpx.Response(503)
         return httpx.Response(202, json={})
@@ -340,22 +351,24 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
 
         # The turn ends: the Stop edge records the pending settle.
         dedupe.pending_settled_response_id = turn_one_id
-        quiet = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_abc",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=after_turn,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-        )
-        assert dedupe.settled_response_id == turn_one_id
-        assert quiet.settled_response_id == turn_one_id
+        quiet = after_turn
+        if wake != "handback_before_settle":
+            quiet = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=after_turn,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+            assert dedupe.settled_response_id == turn_one_id
+            assert quiet.settled_response_id == turn_one_id
 
         # A cron firing appends assistant output with NO user entry; a
         # hand-back appends the sub-agent's report first.
         with transcript_path.open("a", encoding="utf-8") as handle:
-            if wake == "handback":
+            if wake != "cron":
                 handle.write(
                     json.dumps(
                         {
@@ -420,7 +433,10 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
     statuses = [r for r in requests if r["type"] == "external_session_status"]
     items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
     assert len(statuses) + len(items) == len(requests)
-    if retry_mode != "none":
+    if retry_mode == "status":
+        assert statuses[0] == statuses[1]
+        status = statuses[1]
+    elif retry_mode != "none":
         assert items[0]["source_id"] == items[1]["source_id"]
         items = items[1:]
     wake_turn_id = items[0]["response_id"]
@@ -497,21 +513,21 @@ def test_a_late_stop_is_attributed_to_the_turn_that_ended(
     """
     A turn opened before the previous turn's ``Stop`` arrived does not take that Stop.
 
-    Back-to-back sub-agent hand-backs open the next turn before the hook for the
-    last one lands; stamping that Stop with the new turn settled it at once and
-    its reply read as a scheduled wake.
+    A prompt can open the next turn before the hook for the last one lands;
+    stamping that Stop with the new turn settled it at once and its reply read
+    as a scheduled wake.
     """
 
     def user(source: str, text: str, response_id: str, **extra: Any) -> ClaudeTranscriptItem:
         return ClaudeTranscriptItem(
             source_id=f"{source}:0:message",
             item_type="message",
-            data={"role": "user", "content": [{"type": "input_text", "text": text}], **extra},
+            data={"role": "user", "content": [{"type": "input_text", "text": text}]},
             response_id=response_id,
-            subagent_return_id="agent-1" if extra.get("is_meta") else None,
+            **extra,
         )
 
-    items = [user("handback", "<agent-message>done", "resp_h", is_meta=True)]
+    items = [user("prompt", "next", "resp_p", opens_turn=True)]
     if previous == "interrupted":
         items.insert(0, user("esc", "[Request interrupted by user]", "resp_esc"))
     dedupe = forwarder._ForwardDedupeState(
@@ -536,7 +552,11 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
     not mistake that turn for one still awaiting its ``Stop``, or the last
     turn's ``Stop`` is credited to it and the last turn is re-opened as running.
     Once a turn has settled, the late lines must not announce the stopped turn
-    (a prompt, a hand-back or a shell launch) as running either.
+    (a prompt, a hand-back or a shell launch) as running either. A turn that a
+    task notification wakes ends with its own ``Stop``, so the prompts after it
+    are still announced, and a shell launched before an Esc is still counted.
+    A hand-back that lands mid-turn opens no turn, so that turn's ``Stop``
+    leaves the session idle.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -566,12 +586,46 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
         return httpx.Response(202, json={})
 
     def turn(
-        name: str, *, kind: str = "prompt", transcript: bool = True, hooks: bool = True
+        name: str,
+        *,
+        kind: str = "prompt",
+        transcript: bool = True,
+        hooks: bool = True,
+        esc: bool = False,
     ) -> None:
         records: list[dict[str, Any]] = [
             {"type": "user", "message": {"role": "user", "content": name}},
             {"type": "assistant", "message": {"role": "assistant", "content": "ok"}},
         ]
+        if esc:
+            records.append(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "[Request interrupted by user]"}],
+                    },
+                }
+            )
+        if kind == "mid_turn_handback":
+            records += [
+                {
+                    "type": "user",
+                    "isMeta": True,
+                    "origin": {"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
+                    "message": {"role": "user", "content": f"<agent-message>{name}"},
+                },
+                {"type": "assistant", "message": {"role": "assistant", "content": "noted"}},
+            ]
+        if kind == "notification":
+            records[0].update(
+                isMeta=True,
+                message={
+                    "role": "user",
+                    "content": f"<task-notification><task-id>{name}</task-id>"
+                    "<status>completed</status></task-notification>",
+                },
+            )
         if kind == "handback":
             records[0].update(
                 isMeta=True,
@@ -610,10 +664,10 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
                 for index, record in enumerate(records):
                     handle.write(json.dumps({**record, "uuid": f"{name}-{index}"}) + "\n")
         if hooks:
-            events: list[dict[str, Any]] = [{"hook_event_name": "Stop"}]
-            if kind != "handback":
+            events: list[dict[str, Any]] = [] if esc else [{"hook_event_name": "Stop"}]
+            if kind in {"prompt", "shell", "mid_turn_handback"}:
                 events.insert(0, {"hook_event_name": "UserPromptSubmit"})
-            if kind == "shell":
+            if kind == "shell" and not esc:
                 events[-1]["background_tasks"] = [
                     {"id": "bg-1", "type": "shell", "status": "running", "command": "sleep 40"}
                 ]
@@ -667,8 +721,34 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
         for _ in range(3):
             await poll()
 
-    assert [data["status"] for data in posted] == ["idle", "idle", "running", "idle", "idle"]
-    # The Stop's count already includes the shell; its late launch adds nothing.
-    assert [data.get("background_task_count") for data in posted][-1] == (
-        1 if late == "shell" else 0
-    )
+        assert [data["status"] for data in posted] == ["idle", "idle", "running", "idle", "idle"]
+        # The Stop's count already includes the shell; its late launch adds nothing.
+        assert [data.get("background_task_count") for data in posted][-1] == (
+            1 if late == "shell" else 0
+        )
+
+        posted.clear()
+        turn("notified", kind="notification")
+        await poll()
+        await poll()
+        turn("sixth")
+        await poll()
+        await poll()
+        turn("seventh", kind="shell", esc=True)
+        await poll()
+        turn("eighth", kind="mid_turn_handback")
+        for _ in range(3):
+            await poll()
+
+    assert [(data["status"], data.get("background_task_count")) for data in posted] == [
+        ("running", None),
+        ("idle", 0),
+        ("running", None),
+        ("idle", 0),
+        ("running", None),
+        ("running", 1),
+        ("idle", None),
+        ("running", None),
+        ("idle", 0),
+    ]
+    assert posted[-1]["response_id"] == state.current_response_id

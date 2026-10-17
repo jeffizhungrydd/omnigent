@@ -22,6 +22,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    _INTERRUPT_MARKER_PREFIX,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
@@ -4578,8 +4579,13 @@ async def _forward_available_status_events(
             newest = dedupe.newest_turn_source_id
             if newest is not None and newest != dedupe.stopped_turn_source_id:
                 dedupe.stopped_turn_source_id = newest
-            elif newest is not None or response_id is None:
-                # No transcript turn awaits this Stop: its lines are not read yet.
+            elif response_id is None or response_id in {
+                dedupe.settled_response_id,
+                dedupe.pending_settled_response_id,
+                *dedupe.ended_without_stop,
+            }:
+                # The newest transcript turn already ended: this Stop's lines
+                # are not read yet.
                 dedupe.stop_ahead_of_transcript = True
         dedupe.woken_running_response_id = None
         dedupe.unstopped_response_id = None
@@ -4749,9 +4755,6 @@ def _promote_pending_settle(
     return True
 
 
-_INTERRUPT_MARKER_PREFIX = "[Request interrupted by user"
-
-
 def _user_text(item: ClaudeTranscriptItem) -> str | None:
     """Return a user message item's text, or ``None`` for other items."""
     if item.item_type != "message" or item.data.get("role") != "user":
@@ -4764,20 +4767,14 @@ def _user_text(item: ClaudeTranscriptItem) -> str | None:
     ).strip()
 
 
-def _opens_turn(item: ClaudeTranscriptItem) -> bool:
-    """Whether a transcript item starts a turn: a prompt, a wake or a hand-back."""
-    if item.source_id.endswith(":scheduled_wake"):
-        return True
-    if item.subagent_return_id is not None:
-        return item.data.get("is_meta") is True
-    if item.is_compact_summary or item.is_compact_noop or item.agent_message_candidate:
-        return False
-    text = _user_text(item)
-    return (
-        bool(text)
-        and item.data.get("is_meta") is not True
-        and not text.startswith(_INTERRUPT_MARKER_PREFIX)
-    )
+# Dedupe fields ``_track_unstopped_turn`` derives from a transcript batch.
+_TURN_TRACKING_FIELDS = (
+    "unstopped_response_id",
+    "ended_without_stop",
+    "newest_turn_source_id",
+    "stopped_turn_source_id",
+    "stop_ahead_of_transcript",
+)
 
 
 def _track_unstopped_turn(
@@ -4809,7 +4806,7 @@ def _track_unstopped_turn(
             dedupe.stopped_turn_source_id = dedupe.newest_turn_source_id
         if (
             item.response_id != active
-            and _opens_turn(item)
+            and item.opens_turn
             and item.source_id != dedupe.newest_turn_source_id
         ):
             newest = dedupe.newest_turn_source_id
@@ -4834,7 +4831,7 @@ def _track_unstopped_turn(
     return after_end
 
 
-async def _announce_transcript_turns(
+async def _announce_transcript_edges(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -4842,17 +4839,19 @@ async def _announce_transcript_turns(
     seen: set[str],
     dedupe: _ForwardDedupeState,
     after_end: set[str],
-) -> None:
+    retry_tracker: _PostRetryTracker,
+) -> bool:
     """
-    Post the turn edges Claude's status file cannot report.
+    Post, in transcript order, the turn edges Claude's status file cannot report.
 
     The file stays ``busy`` for as long as a background agent is alive, so a
-    turn that starts after the previous one settled (a prompt, a scheduled
-    wake, a sub-agent hand-back) is announced as running here; its ``Stop``
-    posts idle. An Esc fires no ``Stop``, so an announced turn that ends in
-    an interrupt is closed here. Items of the settled or pending-settled turn
-    are its tail, never a new turn, and a turn whose ``Stop`` was already read
-    is never reopened.
+    turn the bridge opens after an earlier one ended (a prompt, a task
+    notification, a scheduled wake, a sub-agent hand-back) is announced as
+    running here; its ``Stop`` posts idle. An Esc fires no ``Stop``, so an
+    announced turn that ends in an interrupt is closed here, and a background
+    shell launch publishes the tally the next ``Stop`` would have reported.
+    Items of the settled or pending-settled turn are its tail, and nothing read
+    after its turn's ``Stop`` is announced: that ``Stop`` already counted it.
 
     :param client: Omnigent API client.
     :param session_id: Session being forwarded.
@@ -4860,13 +4859,16 @@ async def _announce_transcript_turns(
     :param seen: Source ids already forwarded.
     :param dedupe: Mutable per-session dedupe/latch state.
     :param after_end: Source ids of items read after their turn ended.
-    :returns: None.
+    :param retry_tracker: Retry/backoff state for the edge posts.
+    :returns: ``False`` while an edge awaits a retry; its items must wait too.
     """
     finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
     for item in items:
         if item.source_id in seen:
             continue
         text = _user_text(item)
+        task_id = item.background_task_id
+        count = None
         if (
             text is not None
             and text.startswith(_INTERRUPT_MARKER_PREFIX)
@@ -4874,87 +4876,92 @@ async def _announce_transcript_turns(
         ):
             status, response_id = "idle", dedupe.woken_running_response_id
         elif (
-            dedupe.settled_response_id is not None
+            # Some turn has ended, so the status file may no longer report starts.
+            finished != {None}
+            and item.opens_turn
             and item.response_id not in finished
             and item.response_id != dedupe.woken_running_response_id
             and item.source_id not in after_end
-            and _opens_turn(item)
         ):
             status, response_id = "running", item.response_id
+        elif (
+            task_id is not None
+            and task_id not in dedupe.background_task_ids_since_stop
+            and item.response_id not in finished
+            and item.source_id not in after_end
+        ):
+            status, response_id = "running", item.response_id
+            count = (
+                dedupe.stop_background_task_count + len(dedupe.background_task_ids_since_stop) + 1
+            )
         else:
             continue
-        try:
-            await post_external_session_status(
-                client, session_id=session_id, status=status, response_id=response_id
-            )
-        except httpx.HTTPError:
-            # Best effort: the badge catches up on the next status edge.
-            _logger.warning(
-                "Failed to post a transcript turn edge; session=%s status=%s",
-                session_id,
-                status,
-                exc_info=True,
-                extra={"session_id": session_id},
-            )
-            return
-        dedupe.woken_running_response_id = response_id if status == "running" else None
+        if not await _post_transcript_status(
+            client,
+            session_id=session_id,
+            retry_tracker=retry_tracker,
+            retry_key=f"transcript-status:{item.source_id}",
+            status=status,
+            response_id=response_id,
+            background_task_count=count,
+        ):
+            return False
+        if task_id is not None and count is not None:
+            dedupe.background_task_ids_since_stop |= {task_id}
+        else:
+            dedupe.woken_running_response_id = response_id if status == "running" else None
+    return True
 
 
-async def _announce_background_launches(
+async def _post_transcript_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    items: list[ClaudeTranscriptItem],
-    seen: set[str],
-    dedupe: _ForwardDedupeState,
-    after_end: set[str],
-) -> None:
+    retry_tracker: _PostRetryTracker,
+    retry_key: str,
+    status: str,
+    response_id: str,
+    background_task_count: int | None = None,
+) -> bool:
     """
-    Publish the background-shell tally when the active turn launches a shell.
-
-    The server keeps the count across later idle edges, so an Esc, which
-    fires no ``Stop``, no longer drops a shell that is still running. A launch
-    read after its turn's ``Stop`` is skipped: that count already includes it.
+    Post a transcript-derived status edge, holding its items for a retry on failure.
 
     :param client: Omnigent API client.
     :param session_id: Session being forwarded.
-    :param items: Transcript items read this poll.
-    :param seen: Source ids already forwarded.
-    :param dedupe: Mutable per-session dedupe/latch state.
-    :param after_end: Source ids of items read after their turn ended.
-    :returns: None.
+    :param retry_tracker: Retry/backoff state shared with the item posts.
+    :param retry_key: Stable key for this edge, e.g. ``"turn:abc:0:message:running"``.
+    :param status: Status to post, e.g. ``"running"``.
+    :param response_id: Turn the edge belongs to.
+    :param background_task_count: Background-shell tally, when it changed.
+    :returns: ``False`` when the edge must be retried before its items forward.
     """
-    finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
-    launched = {
-        item.background_task_id: item.response_id
-        for item in items
-        if item.background_task_id is not None
-        and item.source_id not in seen
-        and item.source_id not in after_end
-        and item.background_task_id not in dedupe.background_task_ids_since_stop
-        and item.response_id not in finished
-    }
-    if not launched:
-        return
-    task_ids = dedupe.background_task_ids_since_stop | launched.keys()
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return False
     try:
         await post_external_session_status(
             client,
             session_id=session_id,
-            status="running",
-            response_id=list(launched.values())[-1],
-            background_task_count=dedupe.stop_background_task_count + len(task_ids),
+            status=status,
+            response_id=response_id,
+            background_task_count=background_task_count,
         )
-    except httpx.HTTPError:
-        # Best effort: the next Stop reports the authoritative count.
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         _logger.warning(
-            "Failed to post a background shell launch; session=%s",
+            "Failed to post a transcript status edge; session=%s status=%s "
+            "attempt=%s dropped=%s http_status=%s",
             session_id,
+            status,
+            decision.attempts,
+            decision.exhausted,
+            _http_status_for_log(exc),
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
-    dedupe.background_task_ids_since_stop = frozenset(task_ids)
+        # A rejected edge is dropped; the next Stop reports the turn's end.
+        return decision.exhausted
+    retry_tracker.clear(retry_key)
+    return True
 
 
 def _with_settle_latch(
@@ -5242,15 +5249,24 @@ async def _forward_available_items(
     # posts the edges that file cannot report: a turn opened after a settled one
     # (the file stays busy while a background agent lives), an interrupt, and a
     # background-shell launch.
+    untracked = replace(dedupe)
     after_end = _track_unstopped_turn(
         items, seen, dedupe, previous_response_id=state.current_response_id
     )
-    await _announce_transcript_turns(
-        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe, after_end=after_end
-    )
-    await _announce_background_launches(
-        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe, after_end=after_end
-    )
+    if not await _announce_transcript_edges(
+        client,
+        session_id=session_id,
+        items=items,
+        seen=seen,
+        dedupe=dedupe,
+        after_end=after_end,
+        retry_tracker=retry_tracker,
+    ):
+        # Hold the batch so the edge is retried before its items are consumed;
+        # the retry tracks the batch's turns afresh.
+        for name in _TURN_TRACKING_FIELDS:
+            setattr(dedupe, name, getattr(untracked, name))
+        return state
     updated = (
         state
         if state.current_response_id == current_response_id

@@ -2067,6 +2067,7 @@ def test_subagent_handback_is_not_a_scheduled_wake(tmp_path: Path, turn: str) ->
 
     handback, reply = result.items
     assert handback.subagent_return_id == "agent-1"
+    assert handback.opens_turn is (turn != "active")
     assert reply.data["content"][0]["text"] == "the subagent finished"
     if turn != "active":
         assert handback.response_id == reply.response_id != "resp_prev_turn"

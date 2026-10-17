@@ -432,10 +432,15 @@ def test_stop_failure_detail_uses_transcript_api_error_without_warning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_failure", [False, True])
 async def test_background_shell_launch_carries_the_count_through_an_interrupt(
-    tmp_path: Path,
+    tmp_path: Path, status_failure: bool
 ) -> None:
-    """A shell launched in a turn later cut off by Esc (no ``Stop``) is still counted."""
+    """
+    A shell launched in a turn later cut off by Esc (no ``Stop``) is still counted.
+
+    A failed count post holds the batch, so the next poll retries it once.
+    """
     transcript_path = tmp_path / "session.jsonl"
     records = [
         {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "go"}},
@@ -490,11 +495,18 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
     )
     statuses: list[dict[str, Any]] = []
+    item_ids: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_failure
         payload = json.loads(request.content.decode("utf-8"))
         if payload["type"] == "external_session_status":
+            if status_failure:
+                status_failure = False
+                return httpx.Response(503)
             statuses.append(payload["data"])
+        else:
+            item_ids.append(payload["data"]["source_id"])
         return httpx.Response(202, json={})
 
     dedupe = forwarder._ForwardDedupeState(stop_background_task_count=1)
@@ -516,6 +528,7 @@ async def test_background_shell_launch_carries_the_count_through_an_interrupt(
     assert status["status"] == "running"
     # The shell left running by the previous turn plus the one just launched.
     assert status["background_task_count"] == 2
+    assert len(item_ids) == len(set(item_ids)) == 4
 
 
 async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
