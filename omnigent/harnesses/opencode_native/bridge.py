@@ -709,6 +709,22 @@ def update_active_message_id(
     )
 
 
+def update_bridge_status(bridge_dir: Path, status: str) -> None:
+    """
+    Update only the coarse status, keeping the active message id.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param status: New coarse status, ``"idle"`` or ``"busy"``.
+    :returns: None.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None or state.status == status:
+        return
+    import dataclasses
+
+    write_bridge_state(bridge_dir, dataclasses.replace(state, status=status))
+
+
 def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
     """
     Point web injection at the OpenCode session the TUI switched to.

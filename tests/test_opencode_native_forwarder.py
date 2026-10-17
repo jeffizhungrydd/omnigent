@@ -303,8 +303,12 @@ async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
 
 async def test_prompt_in_a_session_picked_from_the_tui_list_switches_to_it() -> None:
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
-    opencode.sessions["ses_old"] = OpenCodeSession(id="ses_old")
     fwd = _forwarder(server, opencode)
+    # A lookup that finds nothing yet must not mark the session a child for good.
+    await fwd.handle_event(_user_turn("ses_old", "msg_o0", "too early")[0])
+    assert server.patches == []
+
+    opencode.sessions["ses_old"] = OpenCodeSession(id="ses_old")
     for event in _user_turn("ses_old", "msg_o1", "back in the old one"):
         await fwd.handle_event(event)
 
@@ -679,6 +683,48 @@ async def test_server_exit_fails_only_an_open_turn() -> None:
     assert [e["status"] for e in edges] == ["running", "failed"]
     assert "exit code -9" in edges[-1]["output"]
     assert edges[-1]["response_id"] == "msg_a"
+
+
+class _PromptAcceptingClient:
+    async def prompt_async(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_server_exit_fails_an_accepted_web_prompt_before_its_events(
+    tmp_path: Path,
+) -> None:
+    """The runner leaves idle to the forwarder, so a crash before the turn's SSE must fail it."""
+    from omnigent.harnesses.opencode_native.bridge import (
+        OpenCodeNativeBridgeState,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+    from omnigent.native.native_server_transport import NativePrompt
+
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    transport = OpenCodeHttpTransport(
+        bridge_dir=tmp_path,
+        client_factory=lambda: _PromptAcceptingClient(),  # type: ignore[arg-type,return-value]
+    )
+
+    await fwd.fail_turn_after_server_exit(1)
+    assert _status_edges(server.posts) == []
+
+    await transport.send_prompt(_SESSION, NativePrompt(text="hi"))
+    await fwd.fail_turn_after_server_exit(1)
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["failed"]
+    assert "exit code 1" in edges[0]["output"]
 
 
 async def test_subagent_permission_goes_through_the_policy_gate() -> None:

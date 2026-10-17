@@ -32,6 +32,7 @@ import httpx
 
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY,
+    read_bridge_state,
     update_active_message_id,
     update_opencode_session_id,
 )
@@ -435,7 +436,7 @@ class OpenCodeNativeForwarder:
 
         :param returncode: The server's exit code, or ``None`` when unknown.
         """
-        if not self.state.turn_active:
+        if not (self.state.turn_active or self._web_prompt_pending()):
             return
         code = f" (exit code {returncode})" if returncode is not None else ""
         await self._end_turn(
@@ -445,6 +446,13 @@ class OpenCodeNativeForwarder:
                 "Send a message or resume the session to restart it."
             },
         )
+
+    def _web_prompt_pending(self) -> bool:
+        """Whether a web prompt was accepted but its turn has not ended yet."""
+        if self._bridge_dir is None:
+            return False
+        state = read_bridge_state(self._bridge_dir)
+        return state is not None and state.status == "busy"
 
     async def _cancel_question_tasks(self) -> None:
         """Cancel and await every in-flight question park task."""
@@ -537,7 +545,10 @@ class OpenCodeNativeForwarder:
             session = await self._opencode.get_session(session_id)
         except (httpx.HTTPError, OpenCodeClientError):
             return False
-        is_root = session is not None and not session.parent_id
+        if session is None:
+            # Unknown, not a child: a later event retries the lookup.
+            return False
+        is_root = not session.parent_id
         self._session_is_root[session_id] = is_root
         return is_root
 
