@@ -561,7 +561,12 @@ class OpenCodeNativeForwarder:
             previous,
             opencode_session_id,
         )
-        if self.state.turn_active or self._pending_text or self._held_user_parts:
+        if (
+            self.state.turn_active
+            or self._pending_text
+            or self._held_user_parts
+            or self._web_prompt_pending()
+        ):
             await self._end_turn()
         self._opencode_session_id = opencode_session_id
         if self._bridge_dir is not None:

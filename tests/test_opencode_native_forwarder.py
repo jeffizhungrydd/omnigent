@@ -301,6 +301,36 @@ async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
     ]
 
 
+async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> None:
+    """A switch before a web prompt's first event still settles that prompt."""
+    from omnigent.harnesses.opencode_native.bridge import (
+        OpenCodeNativeBridgeState,
+        read_bridge_state,
+        update_bridge_status,
+        write_bridge_state,
+    )
+
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    update_bridge_status(tmp_path, "busy")
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    await fwd.handle_event(
+        _event("session.created", sessionID="ses_new", info={"id": "ses_new", "title": "New"})
+    )
+    for event in _user_turn("ses_new", "msg_n1", "after new"):
+        await fwd.handle_event(event)
+
+    assert [e["status"] for e in _status_edges(server.posts)] == ["idle"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.status == "idle"
+    assert state.opencode_session_id == "ses_new"
+
+
 async def test_prompt_in_a_session_picked_from_the_tui_list_switches_to_it() -> None:
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
