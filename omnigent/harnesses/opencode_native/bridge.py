@@ -58,6 +58,9 @@ OPENCODE_SERVER_USERNAME_ENV_VAR = "OPENCODE_SERVER_USERNAME"
 OPENCODE_DEFAULT_USERNAME = "opencode"
 
 _STATE_FILE = "state.json"
+# Marker the harness creates when it injects a web prompt; the forwarder removes
+# it at turn end. Kept out of ``state.json`` so the runner stays its only writer.
+_WEB_PROMPT_PENDING_FILE = "web_prompt_pending"
 _AUTH_SECRET_FILE = "auth.secret"
 _XDG_DATA_DIR = "xdg-data"
 _XDG_CONFIG_DIR = "xdg-config"
@@ -624,10 +627,8 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: None.
     """
-    try:
-        state_path(bridge_dir).unlink()
-    except FileNotFoundError:
-        return
+    state_path(bridge_dir).unlink(missing_ok=True)
+    clear_web_prompt_pending(bridge_dir)
 
 
 def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
@@ -709,20 +710,35 @@ def update_active_message_id(
     )
 
 
-def update_bridge_status(bridge_dir: Path, status: str) -> None:
+def mark_web_prompt_pending(bridge_dir: Path) -> None:
     """
-    Update only the coarse status, keeping the active message id.
+    Record that a web prompt was injected but its turn has not ended yet.
 
     :param bridge_dir: Native OpenCode bridge directory.
-    :param status: New coarse status, ``"idle"`` or ``"busy"``.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None or state.status == status:
-        return
-    import dataclasses
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (bridge_dir / _WEB_PROMPT_PENDING_FILE).touch(mode=0o600)
 
-    write_bridge_state(bridge_dir, dataclasses.replace(state, status=status))
+
+def clear_web_prompt_pending(bridge_dir: Path) -> None:
+    """
+    Drop the pending web prompt marker, if any.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: None.
+    """
+    (bridge_dir / _WEB_PROMPT_PENDING_FILE).unlink(missing_ok=True)
+
+
+def web_prompt_pending(bridge_dir: Path) -> bool:
+    """
+    Whether a web prompt was injected and its turn has not ended yet.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: ``True`` while the pending marker exists.
+    """
+    return (bridge_dir / _WEB_PROMPT_PENDING_FILE).is_file()
 
 
 def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:

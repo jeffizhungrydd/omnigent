@@ -32,9 +32,10 @@ import httpx
 
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY,
-    read_bridge_state,
+    clear_web_prompt_pending,
     update_active_message_id,
     update_opencode_session_id,
+    web_prompt_pending,
 )
 from omnigent.harnesses.opencode_native.client import (
     OpenCodeClient,
@@ -451,8 +452,7 @@ class OpenCodeNativeForwarder:
         """Whether a web prompt was accepted but its turn has not ended yet."""
         if self._bridge_dir is None:
             return False
-        state = read_bridge_state(self._bridge_dir)
-        return state is not None and state.status == "busy"
+        return web_prompt_pending(self._bridge_dir)
 
     async def _cancel_question_tasks(self) -> None:
         """Cancel and await every in-flight question park task."""
@@ -761,6 +761,7 @@ class OpenCodeNativeForwarder:
             merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
+            clear_web_prompt_pending(self._bridge_dir)
         # Prompts held behind the finished reply follow its text, before the edge.
         await self._flush_pending_text()
         self._active_message_open = False

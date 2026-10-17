@@ -325,8 +325,9 @@ async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> 
     """A switch before a web prompt's first event still settles that prompt."""
     from omnigent.harnesses.opencode_native.bridge import (
         OpenCodeNativeBridgeState,
+        mark_web_prompt_pending,
         read_bridge_state,
-        update_bridge_status,
+        web_prompt_pending,
         write_bridge_state,
     )
 
@@ -336,7 +337,7 @@ async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> 
             session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
         ),
     )
-    update_bridge_status(tmp_path, "busy")
+    mark_web_prompt_pending(tmp_path)
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
     await fwd.handle_event(
@@ -346,9 +347,9 @@ async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> 
         await fwd.handle_event(event)
 
     assert [e["status"] for e in _status_edges(server.posts)] == ["idle"]
+    assert not web_prompt_pending(tmp_path)
     state = read_bridge_state(tmp_path)
-    assert state is not None and state.status == "idle"
-    assert state.opencode_session_id == "ses_new"
+    assert state is not None and state.opencode_session_id == "ses_new"
 
 
 async def test_prompt_in_a_session_picked_from_the_tui_list_switches_to_it() -> None:

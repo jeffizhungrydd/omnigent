@@ -108,6 +108,59 @@ def test_update_active_message_id(bridge_dir: Path) -> None:
     assert loaded.status == "idle"
 
 
+async def test_web_prompt_send_never_reverts_a_tui_session_switch(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's session switch survives a web prompt sent by the harness.
+
+    The switch lands right after the harness's first bridge-state read, or
+    during the POST if it reads none, so a stale read-modify-write would undo it.
+    """
+    from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+    from omnigent.native.native_server_transport import NativePrompt
+
+    write_bridge_state(bridge_dir, _state(bridge_dir, opencode_session_id="ses_old"))
+    real_read = bridge.read_bridge_state
+    switched = False
+
+    def switch_once() -> None:
+        nonlocal switched
+        if not switched:
+            switched = True
+            bridge.update_opencode_session_id(bridge_dir, "ses_new")
+
+    def read_then_switch(path: Path) -> OpenCodeNativeBridgeState | None:
+        state = real_read(path)
+        switch_once()
+        return state
+
+    class _Client:
+        async def prompt_async(self, session_id: str, payload: object) -> dict[str, object]:
+            switch_once()
+            return {}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(bridge, "read_bridge_state", read_then_switch)
+    transport = OpenCodeHttpTransport(
+        bridge_dir=bridge_dir,
+        client_factory=lambda: _Client(),  # type: ignore[arg-type,return-value]
+    )
+    await transport.send_prompt("ses_old", NativePrompt(text="hi"))
+
+    state = real_read(bridge_dir)
+    assert switched
+    assert state is not None and state.opencode_session_id == "ses_new"
+    assert bridge.web_prompt_pending(bridge_dir)
+
+
+def test_clear_state_drops_a_stale_web_prompt_marker(bridge_dir: Path) -> None:
+    bridge.mark_web_prompt_pending(bridge_dir)
+    clear_bridge_state(bridge_dir)
+    assert not bridge.web_prompt_pending(bridge_dir)
+
+
 def test_update_model_override(bridge_dir: Path) -> None:
     write_bridge_state(bridge_dir, _state(bridge_dir))
     assert update_model_override(bridge_dir, "anthropic/claude-opus-4") is True

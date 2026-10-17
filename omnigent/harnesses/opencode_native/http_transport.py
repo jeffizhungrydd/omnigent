@@ -23,7 +23,11 @@ from omnigent.harnesses.opencode_native.app_server import (
     client_for_state,
     opencode_terminal_env,
 )
-from omnigent.harnesses.opencode_native.bridge import read_bridge_state, update_bridge_status
+from omnigent.harnesses.opencode_native.bridge import (
+    clear_web_prompt_pending,
+    mark_web_prompt_pending,
+    read_bridge_state,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
@@ -212,20 +216,21 @@ class OpenCodeHttpTransport:
     async def send_prompt(self, session_id: str, prompt: NativePrompt) -> _JsonMapping:
         """Inject a prompt via ``POST /session/{id}/prompt_async``.
 
-        Marks the bridge busy first so a server crash before the forwarder sees
-        the turn still fails it; marking before the POST lets a fast turn's idle
-        land last.
+        Marks the web prompt pending first so a server crash before the forwarder
+        sees the turn still fails it; marking before the POST lets a fast turn's
+        end land last. The marker is a separate file so the runner-owned
+        ``state.json`` is never rewritten from this process.
         """
         client = self._client()
         if self._bridge_dir is not None:
-            update_bridge_status(self._bridge_dir, "busy")
+            mark_web_prompt_pending(self._bridge_dir)
         try:
             return await client.prompt_async(session_id, build_prompt_payload(prompt))
         except BaseException:
             if self._bridge_dir is not None:
                 state = read_bridge_state(self._bridge_dir)
-                if state is not None and state.active_message_id is None:
-                    update_bridge_status(self._bridge_dir, "idle")
+                if state is None or state.active_message_id is None:
+                    clear_web_prompt_pending(self._bridge_dir)
             raise
         finally:
             await client.aclose()
