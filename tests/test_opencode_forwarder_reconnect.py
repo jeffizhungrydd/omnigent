@@ -160,19 +160,32 @@ async def test_run_catches_up_on_reconnect_posts_gap_content() -> None:
     assert texts == ["hello", "from gap"]
 
 
+_AUTH_ERROR = {"name": "ProviderAuthError", "data": {"message": "Invalid API key"}}
+_ABORT_ERROR = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+
+
 @pytest.mark.parametrize(
-    ("finish", "expect_idle"),
-    [("stop", True), ("tool-calls", False), (None, False)],
+    ("finish", "error", "expected_end"),
+    [
+        ("stop", None, "idle"),
+        ("tool-calls", None, None),
+        (None, None, None),
+        (None, _AUTH_ERROR, "failed"),
+        (None, _ABORT_ERROR, "idle"),
+    ],
+    ids=["stop", "tool-calls", "unfinished", "auth-error", "aborted"],
 )
 async def test_reconnect_ends_turn_whose_idle_fell_in_the_gap(
-    finish: str | None, expect_idle: bool
+    finish: str | None, error: dict[str, Any] | None, expected_end: str | None
 ) -> None:
-    """A turn that finished while the SSE stream was down still gets its idle edge."""
+    """A turn that ended while the SSE stream was down still gets its terminal edge."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     info: dict[str, Any] = {"id": "msg_1", "role": "assistant", "time": {"completed": 1}}
     if finish is not None:
         info["finish"] = finish
+    if error is not None:
+        info["error"] = error
     part = {"id": "prt_1", "messageID": "msg_1", "type": "text", "text": "done"}
     opencode.message_snapshots = [[], [{"info": info, "parts": [part]}]]
     # The stream drops after the turn starts; session.idle is never delivered.
@@ -195,14 +208,15 @@ async def test_reconnect_ends_turn_whose_idle_fell_in_the_gap(
     finally:
         fwd_mod.asyncio.sleep = orig_sleep  # type: ignore[assignment]
 
-    statuses = [
-        (b["data"]["status"], b["data"].get("response_id"))
-        for _u, b in server.posts
-        if b["type"] == "external_session_status"
+    edges = [b["data"] for _u, b in server.posts if b["type"] == "external_session_status"]
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        *([(expected_end, "msg_1")] if expected_end else []),
     ]
-    assert statuses[0] == ("running", "msg_1")
-    assert (("idle", "msg_1") in statuses) is expect_idle
-    assert fwd.state.turn_active is not expect_idle
+    assert fwd.state.turn_active is (expected_end is None)
+    if error is _AUTH_ERROR:
+        assert edges[-1]["reauth_required"] is True
+        assert "opencode auth login" in edges[-1]["output"]
 
 
 async def test_catch_up_called_on_reconnect_not_initial_connect() -> None:

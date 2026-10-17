@@ -396,7 +396,11 @@ class OpenCodeNativeForwarder:
             return
         if self._active_message_id is None and isinstance(message_id, str):
             self._active_message_id = message_id
-        await self._end_turn()
+        error = info.get("error")
+        if error:
+            await self._end_turn_for_error(error)
+        else:
+            await self._end_turn()
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -1230,6 +1234,10 @@ class OpenCodeNativeForwarder:
         error = event.properties.get("error")
         _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         await self._flush_pending_text()
+        await self._end_turn_for_error(error)
+
+    async def _end_turn_for_error(self, error: object) -> None:
+        """End the turn for an OpenCode ``{name, data}`` error: idle on abort, else failed."""
         name = error.get("name") if isinstance(error, Mapping) else None
         data = error.get("data") if isinstance(error, Mapping) else None
         if name == "MessageAbortedError":
