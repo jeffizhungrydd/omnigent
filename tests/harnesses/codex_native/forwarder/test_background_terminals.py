@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -41,10 +42,15 @@ def _count_updates(client: _RecordingClient) -> list[dict]:
     return [body["data"] for _, body in client.posts if body["type"] == "subagent.status"]
 
 
-async def _drive(tmp_path: Path, client: _RecordingClient, events: list[dict]) -> None:
+async def _drive(
+    tmp_path: Path,
+    client: _RecordingClient,
+    events: list[dict],
+    state: fwd._CodexForwarderState | None = None,
+) -> None:
     usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
     tracker = fwd._CodexElicitationTaskTracker()
-    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    state = state or fwd._CodexForwarderState(parent_session_id="conv_x")
     for event in events:
         await fwd._handle_event(
             client,  # type: ignore[arg-type]
@@ -126,6 +132,48 @@ async def test_terminal_outliving_its_turn_is_counted_until_it_exits(tmp_path: P
         },
     ]
     assert _count_updates(client) == [{"idle": True, "background_task_count": 0}]
+
+
+class _CountPostFailingClient(_RecordingClient):
+    """Fails ``subagent.status`` posts while ``failing`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = True
+
+    async def post(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
+        response = await super().post(url, json=json, timeout=timeout)
+        if self.failing and json["type"] == "subagent.status":
+            return httpx.Response(500, request=response.request)
+        return response
+
+
+@pytest.mark.asyncio
+async def test_failed_count_clear_is_restated_by_the_next_idle_edge(tmp_path: Path) -> None:
+    """A clear the server never received must not leave its stale tally in place."""
+    _bridge_state(tmp_path)
+    client = _CountPostFailingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    background = _command("exec-bg", "/bin/bash -lc 'sleep 30'")
+
+    await _drive(
+        tmp_path,
+        client,
+        [
+            _TURN_STARTED,
+            _item_event("item/started", background),
+            _TURN_COMPLETED,
+            _item_event("item/completed", {**background, "status": "completed"}),
+        ],
+        state,
+    )
+    client.failing = False
+    await _drive(tmp_path, client, [_TURN_STARTED, _TURN_COMPLETED], state)
+
+    statuses = _statuses(client)
+    assert [s["status"] for s in statuses] == ["running", "idle", "running", "idle"]
+    assert statuses[1]["background_task_count"] == 1
+    assert statuses[3]["background_task_count"] == 0
 
 
 @pytest.mark.asyncio

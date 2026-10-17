@@ -511,6 +511,8 @@ class _CodexForwarderState:
     running_terminals: dict[str, str] = field(default_factory=dict)
     # Terminal count last mirrored, so edges stay unchanged until one runs.
     posted_terminal_count: int = 0
+    # A count post failed, so the next edge must restate the count.
+    terminal_count_unconfirmed: bool = False
 
     def note_terminal_started(self, item: _JsonObject) -> None:
         """
@@ -548,9 +550,14 @@ class _CodexForwarderState:
             an empty list to clear a previously mirrored count, or ``None`` when
             no terminal has been mirrored and none is running.
         """
-        if not self.running_terminals and not self.posted_terminal_count:
+        if (
+            not self.running_terminals
+            and not self.posted_terminal_count
+            and not self.terminal_count_unconfirmed
+        ):
             return None
         self.posted_terminal_count = len(self.running_terminals)
+        self.terminal_count_unconfirmed = False
         return [
             {"id": item_id, "type": "shell", "status": "running", "command": command}
             for item_id, command in self.running_terminals.items()
@@ -4039,7 +4046,9 @@ async def _clear_rotated_terminals(
     forwarder_state.running_terminals.clear()
     background_tasks = forwarder_state.background_tasks_for_edge()
     if background_tasks is not None:
-        await _post_background_task_count(client, old_session_id, background_tasks)
+        await _post_background_task_count(
+            client, old_session_id, background_tasks, forwarder_state
+        )
 
 
 async def _maybe_post_terminal_finished(
@@ -4075,13 +4084,14 @@ async def _maybe_post_terminal_finished(
     background_tasks = forwarder_state.background_tasks_for_edge()
     if background_tasks is None:
         return
-    await _post_background_task_count(client, session_id, background_tasks)
+    await _post_background_task_count(client, session_id, background_tasks, forwarder_state)
 
 
 async def _post_background_task_count(
     client: httpx.AsyncClient,
     session_id: str,
     background_tasks: list[dict[str, object]],
+    forwarder_state: _CodexForwarderState,
 ) -> None:
     """
     Publish a between-turns background-terminal count without completing a turn.
@@ -4094,6 +4104,8 @@ async def _post_background_task_count(
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param background_tasks: Terminals still running; empty clears the count.
+    :param forwarder_state: Marked unconfirmed when delivery fails, so the next
+        edge restates the count instead of leaving the server's stale tally.
     :returns: None.
     """
     data: _JsonObject = {"idle": True, "background_task_count": len(background_tasks)}
@@ -4103,6 +4115,8 @@ async def _post_background_task_count(
         client, session_id, event_type="subagent.status", data=data
     )
     _log_failed_session_event_post("subagent.status", response)
+    if response is None or response.status_code >= 400:
+        forwarder_state.terminal_count_unconfirmed = True
 
 
 async def _handle_terminal_turn_boundary(
