@@ -513,6 +513,8 @@ class _CodexForwarderState:
     posted_terminal_count: int = 0
     # A count post failed, so the next edge must restate the count.
     terminal_count_unconfirmed: bool = False
+    # Rotated-away chat whose zero-count clear failed and still needs a retry.
+    pending_count_clear_session_id: str | None = None
 
     def note_terminal_started(self, item: _JsonObject) -> None:
         """
@@ -4043,12 +4045,29 @@ async def _clear_rotated_terminals(
     :param forwarder_state: Forwarder state tracking running terminals.
     :returns: None.
     """
+    await _retry_pending_count_clear(client, forwarder_state)
     forwarder_state.running_terminals.clear()
-    background_tasks = forwarder_state.background_tasks_for_edge()
-    if background_tasks is not None:
-        await _post_background_task_count(
-            client, old_session_id, background_tasks, forwarder_state
-        )
+    if forwarder_state.background_tasks_for_edge() is None:
+        return
+    # The failure belongs to the old chat, so the new chat's edge has nothing to restate.
+    if not await _send_background_task_count(client, old_session_id, []):
+        forwarder_state.pending_count_clear_session_id = old_session_id
+
+
+async def _retry_pending_count_clear(
+    client: httpx.AsyncClient,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Retry a rotated-away chat's failed background-count clear.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param forwarder_state: Forwarder state holding the pending clear.
+    :returns: None.
+    """
+    session_id = forwarder_state.pending_count_clear_session_id
+    if session_id is not None and await _send_background_task_count(client, session_id, []):
+        forwarder_state.pending_count_clear_session_id = None
 
 
 async def _maybe_post_terminal_finished(
@@ -4108,6 +4127,23 @@ async def _post_background_task_count(
         edge restates the count instead of leaving the server's stale tally.
     :returns: None.
     """
+    if not await _send_background_task_count(client, session_id, background_tasks):
+        forwarder_state.terminal_count_unconfirmed = True
+
+
+async def _send_background_task_count(
+    client: httpx.AsyncClient,
+    session_id: str,
+    background_tasks: list[dict[str, object]],
+) -> bool:
+    """
+    Post a ``subagent.status`` background-terminal count to one session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param background_tasks: Terminals still running; empty clears the count.
+    :returns: ``True`` when the server accepted the post.
+    """
     data: _JsonObject = {"idle": True, "background_task_count": len(background_tasks)}
     if background_tasks:
         data["background_tasks"] = background_tasks
@@ -4115,8 +4151,7 @@ async def _post_background_task_count(
         client, session_id, event_type="subagent.status", data=data
     )
     _log_failed_session_event_post("subagent.status", response)
-    if response is None or response.status_code >= 400:
-        forwarder_state.terminal_count_unconfirmed = True
+    return response is not None and response.status_code < 400
 
 
 async def _handle_terminal_turn_boundary(
@@ -4211,6 +4246,8 @@ async def _handle_terminal_turn_boundary_inner(
     )
     handled = terminal.handled
     if terminal.edge is not None:
+        if forwarder_state is not None and terminal.edge.status == "idle":
+            await _retry_pending_count_clear(client, forwarder_state)
         await _post_turn_status_edge(
             client,
             session_id,
