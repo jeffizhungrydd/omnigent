@@ -217,6 +217,9 @@ class OpenCodeNativeForwarder:
     ) -> None:
         self._session_id = session_id
         self._opencode_session_id = opencode_session_id
+        # The session a relaunch resumes, as last stored on the server; it lags
+        # ``_opencode_session_id`` until a resume-label PATCH succeeds.
+        self._persisted_active_session_id = opencode_session_id
         self._opencode = opencode_client
         self._server = server_client
         self._bridge_dir = bridge_dir
@@ -574,12 +577,7 @@ class OpenCodeNativeForwarder:
         self._opencode_session_id = opencode_session_id
         if self._bridge_dir is not None:
             update_opencode_session_id(self._bridge_dir, opencode_session_id)
-        with contextlib.suppress(httpx.HTTPError):
-            await self._server.patch(
-                f"/v1/sessions/{quote(self._session_id, safe='')}",
-                json={"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: opencode_session_id}},
-                params={"include_usage": "false"},
-            )
+        await self._persist_active_session()
         await self._post_event(
             _EXTERNAL_ITEM,
             {
@@ -594,6 +592,33 @@ class OpenCodeNativeForwarder:
         )
         # A session picked from the TUI list may already hold unmirrored turns.
         await self.catch_up_from_history(finish_missed_turn=False)
+
+    async def _persist_active_session(self) -> None:
+        """Store the followed session as the resume target; retried on turn end until it lands."""
+        target = self._opencode_session_id
+        if target == self._persisted_active_session_id:
+            return
+        try:
+            response = await self._server.patch(
+                f"/v1/sessions/{quote(self._session_id, safe='')}",
+                json={"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: target}},
+                params={"include_usage": "false"},
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "OpenCode forwarder failed to store the resume session for session=%s",
+                self._session_id,
+                exc_info=True,
+            )
+            return
+        if not response.is_success:
+            _logger.warning(
+                "OpenCode forwarder could not store the resume session for session=%s: HTTP %s",
+                self._session_id,
+                response.status_code,
+            )
+            return
+        self._persisted_active_session_id = target
 
     # --- dedupe / keys ---------------------------------------------------
 
@@ -792,6 +817,7 @@ class OpenCodeNativeForwarder:
         await self._post_status(status, extra=merged_extra)
         self._active_message_id = None
         self._running_response_id = None
+        await self._persist_active_session()
 
     # --- per-event handlers ----------------------------------------------
 

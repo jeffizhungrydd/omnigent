@@ -26,10 +26,13 @@ class _RecordingServerClient:
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.hook_response: dict[str, Any] | None = None
         self.patches: list[tuple[str, dict[str, Any]]] = []
+        # Status codes for the next PATCHes; 200 once exhausted.
+        self.patch_statuses: list[int] = []
 
     async def patch(self, url: str, *, json: dict[str, Any], **_kw: Any) -> httpx.Response:
         self.patches.append((url, json))
-        return httpx.Response(200, request=httpx.Request("PATCH", url))
+        status = self.patch_statuses.pop(0) if self.patch_statuses else 200
+        return httpx.Response(status, request=httpx.Request("PATCH", url))
 
     async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
         self.posts.append((url, json))
@@ -305,6 +308,8 @@ async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
         ),
     )
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    # The first resume-label write fails transiently.
+    server.patch_statuses = [503]
     fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
     # OpenCode creates the TUI's new session lazily, with the first prompt.
     await fwd.handle_event(
@@ -316,9 +321,16 @@ async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
     assert _message_texts(server) == [("user", "after new")]
     state = read_bridge_state(tmp_path)
     assert state is not None and state.opencode_session_id == "ses_new"
-    assert server.patches == [
-        ("/v1/sessions/conv_1", {"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: "ses_new"}})
-    ]
+    resume_write = (
+        "/v1/sessions/conv_1",
+        {"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: "ses_new"}},
+    )
+    assert server.patches == [resume_write]
+
+    # The turn end retries the failed write; once stored, it is not rewritten.
+    await fwd.handle_event(_event("session.idle", sessionID="ses_new"))
+    await fwd.handle_event(_event("session.idle", sessionID="ses_new"))
+    assert server.patches == [resume_write, resume_write]
 
 
 def _idempotent_transcript(server: _RecordingServerClient) -> list[tuple[str, str]]:
