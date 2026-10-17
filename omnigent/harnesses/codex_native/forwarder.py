@@ -517,6 +517,8 @@ class _CodexForwarderState:
     terminal_count_unconfirmed: bool = False
     # Rotated-away chats whose zero-count clear failed, oldest first (ordered set).
     pending_count_clear_session_ids: dict[str, None] = field(default_factory=dict)
+    # Cleared once the server rejects ``subagent.status`` as an unknown event type.
+    subagent_status_supported: bool = True
 
     def note_terminal_started(self, item: _JsonObject) -> None:
         """
@@ -4052,7 +4054,9 @@ async def _clear_rotated_terminals(
     if forwarder_state.background_tasks_for_edge() is None:
         return
     # The failure belongs to the old chat, so the new chat's edge has nothing to restate.
-    if not await _send_background_task_count(client, old_session_id, []):
+    # Servers without ``subagent.status`` have no safe clear, so the old chat keeps its count.
+    sent = await _send_background_task_count(client, old_session_id, [], forwarder_state)
+    if not sent and forwarder_state.subagent_status_supported:
         pending = forwarder_state.pending_count_clear_session_ids
         pending[old_session_id] = None
         while len(pending) > _MAX_PENDING_COUNT_CLEARS:
@@ -4074,8 +4078,10 @@ async def _retry_pending_count_clear(
     """
     pending = forwarder_state.pending_count_clear_session_ids
     for session_id in list(pending):
-        if await _send_background_task_count(client, session_id, []):
+        if await _send_background_task_count(client, session_id, [], forwarder_state):
             pending.pop(session_id, None)
+    if not forwarder_state.subagent_status_supported:
+        pending.clear()
 
 
 async def _maybe_post_terminal_finished(
@@ -4126,7 +4132,8 @@ async def _post_background_task_count(
     An ``external_session_status`` idle would settle the session's dispatched
     work, so a sub-agent whose next message is already registered would finish
     before its turn starts. ``subagent.status`` updates the idle indicator and
-    count without reaching the runner.
+    count without reaching the runner. Servers that reject it get the count
+    from the next turn's idle edge instead.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -4135,7 +4142,9 @@ async def _post_background_task_count(
         edge restates the count instead of leaving the server's stale tally.
     :returns: None.
     """
-    if not await _send_background_task_count(client, session_id, background_tasks):
+    if not await _send_background_task_count(
+        client, session_id, background_tasks, forwarder_state
+    ):
         forwarder_state.terminal_count_unconfirmed = True
 
 
@@ -4143,23 +4152,59 @@ async def _send_background_task_count(
     client: httpx.AsyncClient,
     session_id: str,
     background_tasks: list[dict[str, object]],
+    forwarder_state: _CodexForwarderState,
 ) -> bool:
     """
     Post a ``subagent.status`` background-terminal count to one session.
 
+    Once the server rejects the event type, later posts are skipped without
+    another request or warning.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param background_tasks: Terminals still running; empty clears the count.
+    :param forwarder_state: Forwarder state remembering server support.
     :returns: ``True`` when the server accepted the post.
     """
+    if not forwarder_state.subagent_status_supported:
+        return False
     data: _JsonObject = {"idle": True, "background_task_count": len(background_tasks)}
     if background_tasks:
         data["background_tasks"] = background_tasks
     response = await _post_session_event(
         client, session_id, event_type="subagent.status", data=data
     )
+    if _is_unknown_subagent_status_response(response):
+        _logger.info(
+            "Omnigent server does not accept subagent.status; "
+            "background-terminal counts will update on idle edges only"
+        )
+        forwarder_state.subagent_status_supported = False
+        return False
     _log_failed_session_event_post("subagent.status", response)
     return response is not None and response.status_code < 400
+
+
+def _is_unknown_subagent_status_response(response: httpx.Response | None) -> bool:
+    """
+    Return whether a server predating ``subagent.status`` rejected the event type.
+
+    :param response: Final Omnigent response, or ``None`` after transport errors.
+    :returns: ``True`` for the route's unknown-event-type ``invalid_input`` error.
+    """
+    if response is None or response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == "invalid_input"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith("Unknown event type: 'subagent.status'.")
+    )
 
 
 async def _handle_terminal_turn_boundary(

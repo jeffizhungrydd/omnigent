@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import httpx
@@ -308,6 +309,66 @@ async def test_consecutive_failed_rotation_clears_are_all_retried(tmp_path: Path
     assert count_posts == [
         ("/v1/sessions/conv_a/events", {"idle": True, "background_task_count": 0}),
         ("/v1/sessions/conv_b/events", {"idle": True, "background_task_count": 0}),
+    ]
+
+
+class _SubagentStatusRejectingClient(_RecordingClient):
+    """Rejects ``subagent.status`` like servers that predate the event type."""
+
+    async def post(self, url: str, *, json: dict, timeout: float | None = None) -> httpx.Response:
+        response = await super().post(url, json=json, timeout=timeout)
+        if json["type"] != "subagent.status":
+            return response
+        error = {
+            "code": "invalid_input",
+            "message": "Unknown event type: 'subagent.status'. Expected one of: ...",
+        }
+        return httpx.Response(400, json={"error": error}, request=response.request)
+
+
+@pytest.mark.asyncio
+async def test_server_without_count_only_updates_gets_counts_on_idle_edges(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An older server's rejection is learned once; idle edges keep its count current."""
+    _bridge_state(tmp_path)
+    client = _SubagentStatusRejectingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_x")
+    exec_1, exec_2, exec_3 = (_command(f"exec-{n}", "sleep 30") for n in range(1, 4))
+
+    async def lingering_turn(terminal: dict) -> None:
+        events = [_TURN_STARTED, _item_event("item/started", terminal), _TURN_COMPLETED]
+        await _drive(tmp_path, client, events, state)
+
+    with caplog.at_level("INFO", logger=fwd.__name__):
+        await lingering_turn(exec_1)
+        # The first rejected clear arrives during ``/new``.
+        await fwd._clear_rotated_terminals(client, "conv_x", state)  # type: ignore[arg-type]
+        await lingering_turn(exec_2)
+        await _drive(
+            tmp_path,
+            client,
+            [
+                _item_event("item/completed", {**exec_2, "status": "completed"}),
+                _TURN_STARTED,
+                _TURN_COMPLETED,
+            ],
+            state,
+        )
+        await lingering_turn(exec_3)
+        await fwd._clear_rotated_terminals(client, "conv_x", state)  # type: ignore[arg-type]
+        await _drive(tmp_path, client, [_TURN_STARTED, _TURN_COMPLETED], state)
+
+    idle_counts = [
+        s.get("background_task_count") for s in _statuses(client) if s["status"] == "idle"
+    ]
+    assert idle_counts == [1, 1, 0, 1, None]
+    assert len(_count_updates(client)) == 1
+    assert not state.pending_count_clear_session_ids
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "subagent.status" in r.message
     ]
 
 
