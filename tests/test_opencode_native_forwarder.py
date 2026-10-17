@@ -321,6 +321,90 @@ async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
     ]
 
 
+def _idempotent_transcript(server: _RecordingServerClient) -> list[tuple[str, str]]:
+    """Transcript items as the server stores them, dropping reposted ``source_id`` s."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for _url, body in server.posts:
+        data = body["data"]
+        if body["type"] != "external_conversation_item" or data["item_type"] == "error":
+            continue
+        source_id = data.get("source_id")
+        if source_id is not None:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+        item = data["item_data"]
+        if data["item_type"] == "message":
+            out.append((item["role"], item["content"][0]["text"]))
+        else:
+            out.append((data["item_type"], item["call_id"]))
+    return out
+
+
+async def test_returning_to_a_session_mirrored_before_a_restart_shows_it_once() -> None:
+    """Catch-up after a restart reposts old history under its original source ids."""
+    tool_part = {
+        "id": "prt_t",
+        "messageID": "msg_a2",
+        "type": "tool",
+        "callID": "call_1",
+        "tool": "bash",
+        "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+    }
+    server = _RecordingServerClient()
+    first = _forwarder(server, _FakeOpenCodeClient())
+    for event in _user_turn(_SESSION, "msg_a1", "hi in A"):
+        await first.handle_event(event)
+    await first.handle_event(_event("message.updated", info={"id": "msg_a2", "role": "assistant"}))
+    await first.handle_event(_event("message.part.updated", part=tool_part))
+    await first.handle_event(_text_part("prt_a2", "msg_a2", "reply in A"))
+    await first.handle_event(_event("session.idle"))
+    await first.handle_event(
+        _event("session.created", sessionID="ses_B", info={"id": "ses_B", "title": "B"})
+    )
+
+    # The runner restarts on ses_B; the user then picks A in the TUI and prompts.
+    opencode = _FakeOpenCodeClient()
+    opencode.sessions[_SESSION] = OpenCodeSession(id=_SESSION)
+    opencode.messages = [
+        {
+            "info": {"id": "msg_a1", "role": "user"},
+            "parts": [
+                {"id": "prt_msg_a1", "messageID": "msg_a1", "type": "text", "text": "hi in A"}
+            ],
+        },
+        {
+            "info": {
+                "id": "msg_a2",
+                "role": "assistant",
+                "finish": "stop",
+                "time": {"completed": 1},
+            },
+            "parts": [
+                tool_part,
+                {"id": "prt_a2", "messageID": "msg_a2", "type": "text", "text": "reply in A"},
+            ],
+        },
+    ]
+    second = fwd_mod.OpenCodeNativeForwarder(
+        session_id="conv_1",
+        opencode_session_id="ses_B",
+        opencode_client=opencode,  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    for event in _user_turn(_SESSION, "msg_a3", "back in A"):
+        await second.handle_event(event)
+
+    assert _idempotent_transcript(server) == [
+        ("user", "hi in A"),
+        ("function_call", "call_1"),
+        ("function_call_output", "call_1"),
+        ("assistant", "reply in A"),
+        ("user", "back in A"),
+    ]
+
+
 async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> None:
     """A switch before a web prompt's first event still settles that prompt."""
     from omnigent.harnesses.opencode_native.bridge import (

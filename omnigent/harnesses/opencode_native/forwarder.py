@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 from collections import OrderedDict
@@ -59,6 +60,8 @@ _AGENT_NAME = "opencode"
 # Omnigent session-event types (must match the server's ingestion route;
 # shared with the codex-native forwarder).
 _EXTERNAL_ITEM = "external_conversation_item"
+# The Sessions API caps ``data.source_id`` at 256 characters.
+_SOURCE_ID_MAX_CHARS = 256
 _EXTERNAL_STATUS = "external_session_status"
 # Brackets opencode's own compaction; the server maps these to the
 # ``response.compaction.in_progress`` / ``…completed`` SSE the web UI renders.
@@ -655,64 +658,84 @@ class OpenCodeNativeForwarder:
         """
         return message_id or self._opencode_session_id
 
-    async def _post_assistant_text(self, text: str, *, message_id: str | None) -> None:
-        """Persist a finalized assistant message under its per-turn response."""
+    async def _post_item(
+        self,
+        item_type: str,
+        item_data: _JsonObject,
+        *,
+        message_id: str | None,
+        source_key: str,
+    ) -> None:
+        """Persist a transcript item, idempotent server-side on *source_key*.
+
+        The in-memory dedupe keys do not survive a runner restart, so the
+        server drops a repost of the same native item by its ``source_id``.
+        """
         await self._post_event(
             _EXTERNAL_ITEM,
             {
-                "item_type": "message",
-                "item_data": {
-                    "role": "assistant",
-                    "agent": _AGENT_NAME,
-                    "content": [{"type": "output_text", "text": text}],
-                },
+                "item_type": item_type,
+                "item_data": item_data,
                 "response_id": self._response_id(message_id),
+                "source_id": _bounded_source_id(source_key),
             },
         )
 
-    async def _post_user_text(self, text: str, *, message_id: str | None) -> None:
-        """Persist a user message mirrored from the native transcript."""
-        await self._post_event(
-            _EXTERNAL_ITEM,
+    async def _post_assistant_text(
+        self, text: str, *, message_id: str | None, source_key: str
+    ) -> None:
+        """Persist a finalized assistant message under its per-turn response."""
+        await self._post_item(
+            "message",
             {
-                "item_type": "message",
-                "item_data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-                "response_id": self._response_id(message_id),
+                "role": "assistant",
+                "agent": _AGENT_NAME,
+                "content": [{"type": "output_text", "text": text}],
             },
+            message_id=message_id,
+            source_key=source_key,
+        )
+
+    async def _post_user_text(self, text: str, *, message_id: str | None, source_key: str) -> None:
+        """Persist a user message mirrored from the native transcript."""
+        await self._post_item(
+            "message",
+            {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            message_id=message_id,
+            source_key=source_key,
         )
 
     async def _post_tool_call(
-        self, call_id: str, tool: str, arguments: _JsonObject, *, message_id: str | None
+        self,
+        call_id: str,
+        tool: str,
+        arguments: _JsonObject,
+        *,
+        message_id: str | None,
+        source_key: str,
     ) -> None:
         """Mirror a tool invocation as a function_call item."""
-        await self._post_event(
-            _EXTERNAL_ITEM,
+        await self._post_item(
+            "function_call",
             {
-                "item_type": "function_call",
-                "item_data": {
-                    "agent": _AGENT_NAME,
-                    "name": tool,
-                    "arguments": json.dumps(arguments, ensure_ascii=True),
-                    "call_id": call_id,
-                },
-                "response_id": self._response_id(message_id),
+                "agent": _AGENT_NAME,
+                "name": tool,
+                "arguments": json.dumps(arguments, ensure_ascii=True),
+                "call_id": call_id,
             },
+            message_id=message_id,
+            source_key=source_key,
         )
 
     async def _post_tool_output(
-        self, call_id: str, output: str, *, message_id: str | None
+        self, call_id: str, output: str, *, message_id: str | None, source_key: str
     ) -> None:
         """Mirror a tool result as a function_call_output item."""
-        await self._post_event(
-            _EXTERNAL_ITEM,
-            {
-                "item_type": "function_call_output",
-                "item_data": {"call_id": call_id, "output": output},
-                "response_id": self._response_id(message_id),
-            },
+        await self._post_item(
+            "function_call_output",
+            {"call_id": call_id, "output": output},
+            message_id=message_id,
+            source_key=source_key,
         )
 
     async def _begin_turn_if_needed(self) -> None:
@@ -902,10 +925,11 @@ class OpenCodeNativeForwarder:
         message_id = part.get("messageID")
         if not isinstance(part_id, str) or not isinstance(text, str) or not text:
             return
-        if not self.state.mark(self._key("user-text", part_id)):
+        key = self._key("user-text", part_id)
+        if not self.state.mark(key):
             return
         await self._post_user_text(
-            text, message_id=message_id if isinstance(message_id, str) else None
+            text, message_id=message_id if isinstance(message_id, str) else None, source_key=key
         )
 
     async def _flush_pending_text(self, *, before: str | None = None) -> None:
@@ -916,9 +940,10 @@ class OpenCodeNativeForwarder:
             self._pending_text.pop(part_id, None)
             if not text:
                 continue
-            if not self.state.mark(self._key("text-final", part_id)):
+            key = self._key("text-final", part_id)
+            if not self.state.mark(key):
                 continue
-            await self._post_assistant_text(text, message_id=message_id)
+            await self._post_assistant_text(text, message_id=message_id, source_key=key)
 
     async def _handle_tool_part(self, part: _JsonMapping) -> None:
         """Mirror an opencode tool part (call + result) as chat items.
@@ -939,20 +964,28 @@ class OpenCodeNativeForwarder:
         response_message_id = message_id if isinstance(message_id, str) else None
         raw_input = state.get("input")
         arguments = raw_input if isinstance(raw_input, dict) else {}
-        if arguments and self.state.mark(self._key("tool-call", call_id)):
+        call_key = self._key("tool-call", call_id)
+        if arguments and self.state.mark(call_key):
             await self._begin_turn_if_needed()
-            await self._post_tool_call(call_id, tool, arguments, message_id=response_message_id)
+            await self._post_tool_call(
+                call_id, tool, arguments, message_id=response_message_id, source_key=call_key
+            )
         status = state.get("status")
-        if status == "completed" and self.state.mark(self._key("tool-out", call_id)):
+        out_key = self._key("tool-out", call_id)
+        if status == "completed" and self.state.mark(out_key):
             await self._post_tool_output(
                 call_id,
                 opencode_tool_output_text(state),
                 message_id=response_message_id,
+                source_key=out_key,
             )
-        elif status == "error" and self.state.mark(self._key("tool-out", call_id)):
+        elif status == "error" and self.state.mark(out_key):
             error = state.get("error")
             await self._post_tool_output(
-                call_id, f"[error] {error}" if error else "[error]", message_id=response_message_id
+                call_id,
+                f"[error] {error}" if error else "[error]",
+                message_id=response_message_id,
+                source_key=out_key,
             )
 
     async def _handle_reasoning_part(self, part: _JsonMapping) -> None:
@@ -999,7 +1032,8 @@ class OpenCodeNativeForwarder:
         url = part.get("url")
         if not isinstance(part_id, str):
             return
-        if not self.state.mark(self._key("file", part_id)):
+        key = self._key("file", part_id)
+        if not self.state.mark(key):
             return
         message_id = part.get("messageID")
         response_message_id = message_id if isinstance(message_id, str) else None
@@ -1008,7 +1042,10 @@ class OpenCodeNativeForwarder:
         if isinstance(mime, str) and mime.startswith("image/") and isinstance(url, str) and url:
             block_type = "input_image" if role == "user" else "output_image"
             await self._post_message_content(
-                role, [{"type": block_type, "image_url": url}], message_id=response_message_id
+                role,
+                [{"type": block_type, "image_url": url}],
+                message_id=response_message_id,
+                source_key=key,
             )
             return
         # Non-image attachment → a short text reference (text-flattened).
@@ -1019,23 +1056,17 @@ class OpenCodeNativeForwarder:
             role,
             [{"type": block_type, "text": f"[attachment: {label}]"}],
             message_id=response_message_id,
+            source_key=key,
         )
 
     async def _post_message_content(
-        self, role: str, content: list[_JsonObject], *, message_id: str | None
+        self, role: str, content: list[_JsonObject], *, message_id: str | None, source_key: str
     ) -> None:
         """Persist a message item with arbitrary content blocks (image / note)."""
         item_data: _JsonObject = {"role": role, "content": content}
         if role == "assistant":
             item_data["agent"] = _AGENT_NAME
-        await self._post_event(
-            _EXTERNAL_ITEM,
-            {
-                "item_type": "message",
-                "item_data": item_data,
-                "response_id": self._response_id(message_id),
-            },
-        )
+        await self._post_item("message", item_data, message_id=message_id, source_key=source_key)
 
     async def _on_session_status(self, event: OpenCodeEvent) -> None:
         """Handle ``session.status`` — surface the running edge."""
@@ -1468,6 +1499,13 @@ class OpenCodeNativeForwarder:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
+
+
+def _bounded_source_id(source_key: str) -> str:
+    """Keep a stable source id within the Sessions API limit."""
+    if len(source_key) <= _SOURCE_ID_MAX_CHARS:
+        return source_key
+    return "opencode:" + hashlib.sha256(source_key.encode("utf-8")).hexdigest()
 
 
 def opencode_tool_output_text(state: _JsonMapping) -> str:
