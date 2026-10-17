@@ -524,7 +524,10 @@ def test_a_late_stop_is_attributed_to_the_turn_that_ended(
 
 
 @pytest.mark.asyncio
-async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("late", ["prompt", "handback", "shell"])
+async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(
+    tmp_path: Path, late: str
+) -> None:
     """
     A ``Stop`` read before its turn's transcript lines still settles that turn.
 
@@ -532,6 +535,8 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(tmp_path
     ``Stop`` can be read first and stamped with no turn. The next prompt must
     not mistake that turn for one still awaiting its ``Stop``, or the last
     turn's ``Stop`` is credited to it and the last turn is re-opened as running.
+    Once a turn has settled, the late lines must not announce the stopped turn
+    (a prompt, a hand-back or a shell launch) as running either.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -552,31 +557,68 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(tmp_path
     )
     hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
     dedupe = forwarder._ForwardDedupeState()
-    statuses: list[str] = []
+    posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode("utf-8"))
         if payload["type"] == "external_session_status":
-            statuses.append(payload["data"]["status"])
+            posted.append(payload["data"])
         return httpx.Response(202, json={})
 
-    def turn(name: str, *, transcript: bool = True, hooks: bool = True) -> None:
+    def turn(
+        name: str, *, kind: str = "prompt", transcript: bool = True, hooks: bool = True
+    ) -> None:
+        records: list[dict[str, Any]] = [
+            {"type": "user", "message": {"role": "user", "content": name}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "ok"}},
+        ]
+        if kind == "handback":
+            records[0].update(
+                isMeta=True,
+                origin={"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
+                message={"role": "user", "content": f"<agent-message>{name}"},
+            )
+        if kind == "shell":
+            records[1:1] = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_bg",
+                                "name": "Bash",
+                                "input": {"command": "sleep 40", "run_in_background": True},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "toolUseResult": {"backgroundTaskId": "bg-1"},
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_bg", "content": "ok"}
+                        ],
+                    },
+                },
+            ]
         if transcript:
             with transcript_path.open("a", encoding="utf-8") as handle:
-                for role, content in (
-                    ("user", name),
-                    ("assistant", [{"type": "text", "text": "ok"}]),
-                ):
-                    record = {"type": role, "uuid": f"{name}-{role}"}
-                    handle.write(
-                        json.dumps({**record, "message": {"role": role, "content": content}})
-                        + "\n"
-                    )
+                for index, record in enumerate(records):
+                    handle.write(json.dumps({**record, "uuid": f"{name}-{index}"}) + "\n")
         if hooks:
-            for event in ("UserPromptSubmit", "Stop"):
-                record_hook_event(
-                    bridge_dir, {"hook_event_name": event, "session_id": "claude-session"}
-                )
+            events: list[dict[str, Any]] = [{"hook_event_name": "Stop"}]
+            if kind != "handback":
+                events.insert(0, {"hook_event_name": "UserPromptSubmit"})
+            if kind == "shell":
+                events[-1]["background_tasks"] = [
+                    {"id": "bg-1", "type": "shell", "status": "running", "command": "sleep 40"}
+                ]
+            for event in events:
+                record_hook_event(bridge_dir, {**event, "session_id": "claude-session"})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://test"
@@ -615,5 +657,18 @@ async def test_a_stop_ahead_of_its_transcript_leaves_the_last_turn_idle(tmp_path
             turn(name)
             await poll()
             await poll()
+        assert dedupe.settled_response_id is not None
+        assert [data["status"] for data in posted] == ["idle", "idle", "running", "idle"]
 
-    assert statuses == ["idle", "idle", "running", "idle"]
+        # The next turn's only Stop is read before its lines; nothing else ends it.
+        turn("fourth", kind=late, transcript=False)
+        await poll()
+        turn("fourth", kind=late, hooks=False)
+        for _ in range(3):
+            await poll()
+
+    assert [data["status"] for data in posted] == ["idle", "idle", "running", "idle", "idle"]
+    # The Stop's count already includes the shell; its late launch adds nothing.
+    assert [data.get("background_task_count") for data in posted][-1] == (
+        1 if late == "shell" else 0
+    )

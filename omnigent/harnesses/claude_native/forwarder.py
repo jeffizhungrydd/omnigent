@@ -4786,7 +4786,7 @@ def _track_unstopped_turn(
     dedupe: _ForwardDedupeState,
     *,
     previous_response_id: str | None,
-) -> None:
+) -> set[str]:
     """
     Remember the turn whose ``Stop`` is still due when a new turn opens.
 
@@ -4794,9 +4794,10 @@ def _track_unstopped_turn(
     :param seen: Source ids already forwarded.
     :param dedupe: Mutable per-session dedupe/latch state.
     :param previous_response_id: Active turn before this batch, if any.
-    :returns: None.
+    :returns: Source ids of items read after their turn already ended.
     """
     ended = list(dedupe.ended_without_stop)
+    after_end: set[str] = set()
     active = previous_response_id
     for item in items:
         if item.source_id in seen:
@@ -4825,8 +4826,12 @@ def _track_unstopped_turn(
                 # A Stop read before this turn's lines has already ended it.
                 dedupe.stopped_turn_source_id = item.source_id
                 dedupe.stop_ahead_of_transcript = False
+        newest = dedupe.newest_turn_source_id
+        if newest is not None and newest == dedupe.stopped_turn_source_id:
+            after_end.add(item.source_id)
         active = item.response_id
     dedupe.ended_without_stop = tuple(ended[-16:])
+    return after_end
 
 
 async def _announce_transcript_turns(
@@ -4836,6 +4841,7 @@ async def _announce_transcript_turns(
     items: list[ClaudeTranscriptItem],
     seen: set[str],
     dedupe: _ForwardDedupeState,
+    after_end: set[str],
 ) -> None:
     """
     Post the turn edges Claude's status file cannot report.
@@ -4845,13 +4851,15 @@ async def _announce_transcript_turns(
     wake, a sub-agent hand-back) is announced as running here; its ``Stop``
     posts idle. An Esc fires no ``Stop``, so an announced turn that ends in
     an interrupt is closed here. Items of the settled or pending-settled turn
-    are its tail, never a new turn.
+    are its tail, never a new turn, and a turn whose ``Stop`` was already read
+    is never reopened.
 
     :param client: Omnigent API client.
     :param session_id: Session being forwarded.
     :param items: Transcript items read this poll.
     :param seen: Source ids already forwarded.
     :param dedupe: Mutable per-session dedupe/latch state.
+    :param after_end: Source ids of items read after their turn ended.
     :returns: None.
     """
     finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
@@ -4869,6 +4877,7 @@ async def _announce_transcript_turns(
             dedupe.settled_response_id is not None
             and item.response_id not in finished
             and item.response_id != dedupe.woken_running_response_id
+            and item.source_id not in after_end
             and _opens_turn(item)
         ):
             status, response_id = "running", item.response_id
@@ -4898,18 +4907,21 @@ async def _announce_background_launches(
     items: list[ClaudeTranscriptItem],
     seen: set[str],
     dedupe: _ForwardDedupeState,
+    after_end: set[str],
 ) -> None:
     """
     Publish the background-shell tally when the active turn launches a shell.
 
     The server keeps the count across later idle edges, so an Esc, which
-    fires no ``Stop``, no longer drops a shell that is still running.
+    fires no ``Stop``, no longer drops a shell that is still running. A launch
+    read after its turn's ``Stop`` is skipped: that count already includes it.
 
     :param client: Omnigent API client.
     :param session_id: Session being forwarded.
     :param items: Transcript items read this poll.
     :param seen: Source ids already forwarded.
     :param dedupe: Mutable per-session dedupe/latch state.
+    :param after_end: Source ids of items read after their turn ended.
     :returns: None.
     """
     finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
@@ -4918,6 +4930,7 @@ async def _announce_background_launches(
         for item in items
         if item.background_task_id is not None
         and item.source_id not in seen
+        and item.source_id not in after_end
         and item.background_task_id not in dedupe.background_task_ids_since_stop
         and item.response_id not in finished
     }
@@ -5229,12 +5242,14 @@ async def _forward_available_items(
     # posts the edges that file cannot report: a turn opened after a settled one
     # (the file stays busy while a background agent lives), an interrupt, and a
     # background-shell launch.
-    _track_unstopped_turn(items, seen, dedupe, previous_response_id=state.current_response_id)
+    after_end = _track_unstopped_turn(
+        items, seen, dedupe, previous_response_id=state.current_response_id
+    )
     await _announce_transcript_turns(
-        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe
+        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe, after_end=after_end
     )
     await _announce_background_launches(
-        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe
+        client, session_id=session_id, items=items, seen=seen, dedupe=dedupe, after_end=after_end
     )
     updated = (
         state
